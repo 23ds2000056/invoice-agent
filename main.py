@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -51,6 +51,38 @@ TERMINAL_STATES = {
 }
 
 DB_PATH = Path("invoice_agent.db")
+
+
+# -------------------------
+# Responses
+# -------------------------
+
+def a2a_json_response(
+    content: Any,
+    status_code: int = 200,
+) -> JSONResponse:
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        media_type=A2A_JSON,
+    )
+
+
+def a2a_error(
+    status_code: int,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        media_type=A2A_JSON,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        },
+    )
 
 
 # -------------------------
@@ -138,41 +170,53 @@ def new_id(prefix: str) -> str:
 
 def get_principal(
     authorization: Optional[str] = Header(default=None),
-) -> str:
+) -> Any:
     if not authorization:
-        raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
+        return a2a_error(401, "UNAUTHENTICATED", "Authentication required.")
 
     parts = authorization.split(" ", 1)
 
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
+        return a2a_error(401, "UNAUTHENTICATED", "Authentication required.")
 
     token = parts[1].strip()
 
     if token not in ALLOWED_TOKENS:
-        raise HTTPException(status_code=403, detail="FORBIDDEN")
+        return a2a_error(403, "FORBIDDEN", "Invalid bearer token.")
 
     return hash_token(token)
 
 
 def require_a2a_version(
     a2a_version: Optional[str] = Header(default=None),
-) -> None:
+) -> Any:
     if a2a_version != A2A_VERSION:
-        raise HTTPException(status_code=400, detail="UNSUPPORTED_A2A_VERSION")
+        return a2a_error(
+            400,
+            "UNSUPPORTED_A2A_VERSION",
+            "Unsupported A2A-Version.",
+        )
 
 
 def require_a2a_body_headers(
     a2a_version: Optional[str] = Header(default=None),
     content_type: Optional[str] = Header(default=None),
-) -> None:
+) -> Any:
     if a2a_version != A2A_VERSION:
-        raise HTTPException(status_code=400, detail="UNSUPPORTED_A2A_VERSION")
+        return a2a_error(
+            400,
+            "UNSUPPORTED_A2A_VERSION",
+            "Unsupported A2A-Version.",
+        )
 
     media_type = (content_type or "").split(";")[0].strip()
 
     if media_type != A2A_JSON:
-        raise HTTPException(status_code=415, detail="UNSUPPORTED_MEDIA_TYPE")
+        return a2a_error(
+            415,
+            "UNSUPPORTED_MEDIA_TYPE",
+            "Unsupported Content-Type.",
+        )
 
 
 # -------------------------
@@ -475,7 +519,7 @@ def get_task_for_principal(
     conn: sqlite3.Connection,
     principal_hash: str,
     task_id: str,
-) -> sqlite3.Row:
+) -> Any:
     row = conn.execute(
         """
         SELECT * FROM tasks
@@ -485,7 +529,7 @@ def get_task_for_principal(
     ).fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+        return a2a_error(404, "TASK_NOT_FOUND", "Task not found.")
 
     return row
 
@@ -533,533 +577,19 @@ app = FastAPI(title="Invoice Action Agent", lifespan=lifespan)
 
 
 @app.get("/.well-known/agent-card.json")
-async def agent_card() -> dict[str, Any]:
-    return {
-        "name": "Invoice Action Agent",
-        "description": (
-            "Reads invoice packages, proposes one evidence-based action per "
-            "package, and executes only grader-approved actions."
-        ),
-        "version": "1.0.0",
-        "capabilities": {},
-        "supportedInterfaces": [
-            {
-                "url": BASE_URL,
-                "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0",
-            }
-        ],
-        "defaultInputModes": [BATCH_MEDIA_TYPE],
-        "defaultOutputModes": [
-            PROPOSALS_MEDIA_TYPE,
-            RECEIPTS_MEDIA_TYPE,
-        ],
-        "skills": [
-            {
-                "name": "invoice_action_agent",
-                "description": (
-                    "Chooses settle, approval, hold, duplicate-rejection, or "
-                    "exception actions from invoice evidence."
-                ),
-                "tags": [
-                    "invoices",
-                    "finance",
-                    "approval",
-                    "duplicate-detection",
-                ],
-            }
-        ],
-    }
-
-
-@app.post("/a2a/message:send")
-async def message_send(
-    request: Request,
-    body: SendMessageRequest,
-    principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_body_headers),
-) -> Response:
-    message_dict = body.message.model_dump(exclude_none=True)
-
-    message_hash = sha256_json(message_dict)
-    message_id = body.message.messageId
-
-    if not body.message.parts:
-        raise HTTPException(status_code=400, detail="INVALID_MESSAGE")
-
-    batch_part = next(
-        (
-            part
-            for part in body.message.parts
-            if part.mediaType == BATCH_MEDIA_TYPE and isinstance(part.data, dict)
-        ),
-        None,
-    )
-
-    result_part = next(
-        (
-            part
-            for part in body.message.parts
-            if part.mediaType == RESULTS_MEDIA_TYPE and isinstance(part.data, dict)
-        ),
-        None,
-    )
-
-    if batch_part:
-        return await handle_initial_batch(
-            principal_hash=principal_hash,
-            message_dict=message_dict,
-            message_id=message_id,
-            message_hash=message_hash,
-            batch_data=batch_part.data,
-        )
-
-    if result_part:
-        return await handle_result_continuation(
-            principal_hash=principal_hash,
-            message_dict=message_dict,
-            message_id=message_id,
-            message_hash=message_hash,
-            result_data=result_part.data,
-        )
-
-    raise HTTPException(status_code=400, detail="UNSUPPORTED_INPUT_MEDIA_TYPE")
-
-
-async def handle_initial_batch(
-    principal_hash: str,
-    message_dict: dict[str, Any],
-    message_id: str,
-    message_hash: str,
-    batch_data: dict[str, Any],
-) -> Response:
-    batch_id = batch_data.get("batchId")
-    packages = batch_data.get("packages")
-
-    if not isinstance(batch_id, str) or not batch_id:
-        raise HTTPException(status_code=400, detail="INVALID_BATCH")
-
-    if not isinstance(packages, list) or not packages:
-        raise HTTPException(status_code=400, detail="INVALID_PACKAGES")
-
-    with db() as conn:
-        existing = conn.execute(
-            """
-            SELECT task_id, message_hash
-            FROM message_dedup
-            WHERE principal_hash = ? AND message_id = ?
-            """,
-            (principal_hash, message_id),
-        ).fetchone()
-
-        if existing:
-            if existing["message_hash"] != message_hash:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "error": {
-                            "code": "IDEMPOTENCY_CONFLICT",
-                            "message": "Message ID reused with different content.",
-                        }
-                    },
-                )
-
-            task_row = conn.execute(
-                "SELECT * FROM tasks WHERE task_id = ?",
-                (existing["task_id"],),
-            ).fetchone()
-
-            return JSONResponse(
-                content={"task": task_to_public_dict(task_row)}
-            )
-
-    decisions = await ai_decide_packages(packages)
-
-    proposals: list[dict[str, Any]] = []
-    seen_package_ids: set[str] = set()
-    seen_action_ids: set[str] = set()
-
-    for package in packages:
-        package_id = package.get("packageId")
-
-        if not isinstance(package_id, str) or not package_id:
-            raise HTTPException(status_code=400, detail="INVALID_PACKAGE_ID")
-
-        if package_id in seen_package_ids:
-            raise HTTPException(status_code=400, detail="DUPLICATE_PACKAGE_ID")
-
-        seen_package_ids.add(package_id)
-
-        decision = decisions.get(package_id)
-
-        if not decision or decision.get("action") not in VALID_ACTIONS:
-            decision = local_fallback_decision(package)
-
-        proposal = build_proposal(package, decision)
-
-        while proposal["actionId"] in seen_action_ids:
-            proposal["actionId"] = f"act{uuid.uuid4().hex}"
-
-        seen_action_ids.add(proposal["actionId"])
-        proposals.append(proposal)
-
-    task_id = new_id("task")
-    context_id = new_id("context")
-    now = utc_now()
-
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO tasks (
-                task_id, context_id, principal_hash, batch_id, state,
-                history_json, proposals_json, receipt_json,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-            """,
-            (
-                task_id,
-                context_id,
-                principal_hash,
-                batch_id,
-                "TASK_STATE_INPUT_REQUIRED",
-                canonical_json([message_dict]),
-                canonical_json(proposals),
-                now,
-                now,
+async def agent_card() -> JSONResponse:
+    return a2a_json_response(
+        {
+            "name": "Invoice Action Agent",
+            "description": (
+                "Reads invoice packages, proposes one evidence-based action per "
+                "package, and executes only grader-approved actions."
             ),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO message_dedup (
-                principal_hash, message_id, message_hash, task_id, created_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (principal_hash, message_id, message_hash, task_id, now),
-        )
-
-        task_row = conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-
-    return JSONResponse(content={"task": task_to_public_dict(task_row)})
-
-
-async def handle_result_continuation(
-    principal_hash: str,
-    message_dict: dict[str, Any],
-    message_id: str,
-    message_hash: str,
-    result_data: dict[str, Any],
-) -> Response:
-    task_id = message_dict.get("taskId")
-    context_id = message_dict.get("contextId")
-    batch_id = result_data.get("batchId")
-    results = result_data.get("results")
-
-    if not isinstance(task_id, str) or not task_id:
-        raise HTTPException(status_code=400, detail="INVALID_TASK_ID")
-
-    if not isinstance(context_id, str) or not context_id:
-        raise HTTPException(status_code=400, detail="INVALID_CONTEXT_ID")
-
-    if not isinstance(batch_id, str) or not batch_id:
-        raise HTTPException(status_code=400, detail="INVALID_BATCH")
-
-    if not isinstance(results, list):
-        raise HTTPException(status_code=400, detail="INVALID_RESULTS")
-
-    with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-
-        existing = conn.execute(
-            """
-            SELECT task_id, message_hash
-            FROM message_dedup
-            WHERE principal_hash = ? AND message_id = ?
-            """,
-            (principal_hash, message_id),
-        ).fetchone()
-
-        if existing:
-            conn.rollback()
-
-            if existing["message_hash"] != message_hash:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "error": {
-                            "code": "IDEMPOTENCY_CONFLICT",
-                            "message": "Message ID reused with different content.",
-                        }
-                    },
-                )
-
-            task_row = conn.execute(
-                "SELECT * FROM tasks WHERE task_id = ?",
-                (existing["task_id"],),
-            ).fetchone()
-
-            return JSONResponse(
-                content={"task": task_to_public_dict(task_row)}
-            )
-
-        task_row = get_task_for_principal(conn, principal_hash, task_id)
-
-        if task_row["context_id"] != context_id:
-            conn.rollback()
-            raise HTTPException(status_code=400, detail="CONTEXT_MISMATCH")
-
-        if task_row["batch_id"] != batch_id:
-            conn.rollback()
-            raise HTTPException(status_code=400, detail="BATCH_MISMATCH")
-
-        if task_row["state"] == "TASK_STATE_CANCELED":
-            conn.rollback()
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "TASK_CANCELED",
-                        "message": "Task was canceled.",
-                    }
-                },
-            )
-
-        if task_row["state"] in TERMINAL_STATES:
-            conn.rollback()
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "TASK_ALREADY_TERMINAL",
-                        "message": "Task is already terminal.",
-                    }
-                },
-            )
-
-        proposals = json.loads(task_row["proposals_json"])
-        proposals_by_key = {
-            (proposal["packageId"], proposal["actionId"]): proposal
-            for proposal in proposals
-        }
-
-        executions: list[dict[str, Any]] = []
-        seen_result_keys: set[tuple[str, str]] = set()
-
-        for result in results:
-            package_id = result.get("packageId")
-            action_id = result.get("actionId")
-            action = result.get("action")
-            outcome = result.get("outcome")
-            receipt_nonce = result.get("receiptNonce")
-
-            key = (package_id, action_id)
-
-            if key in seen_result_keys:
-                conn.rollback()
-                raise HTTPException(status_code=400, detail="DUPLICATE_RESULT")
-
-            seen_result_keys.add(key)
-
-            proposal = proposals_by_key.get(key)
-
-            if not proposal:
-                conn.rollback()
-                raise HTTPException(status_code=400, detail="PROPOSAL_MISMATCH")
-
-            if proposal["action"] != action:
-                conn.rollback()
-                raise HTTPException(status_code=400, detail="ACTION_MISMATCH")
-
-            if outcome not in {"ACCEPTED", "REJECTED"}:
-                conn.rollback()
-                raise HTTPException(status_code=400, detail="INVALID_OUTCOME")
-
-            if outcome == "ACCEPTED":
-                if not isinstance(receipt_nonce, str) or not receipt_nonce:
-                    conn.rollback()
-                    raise HTTPException(
-                        status_code=400,
-                        detail="MISSING_RECEIPT_NONCE",
-                    )
-
-                executions.append(
-                    {
-                        "packageId": package_id,
-                        "actionId": action_id,
-                        "action": action,
-                        "receiptNonce": receipt_nonce,
-                        "facts": proposal["facts"],
-                        "evidenceRefs": proposal["evidenceRefs"],
-                    }
-                )
-
-        receipt = {
-            "batchId": batch_id,
-            "executions": executions,
-        }
-
-        history = json.loads(task_row["history_json"])
-        history.append(message_dict)
-
-        now = utc_now()
-
-        conn.execute(
-            """
-            UPDATE tasks
-            SET state = ?,
-                receipt_json = ?,
-                history_json = ?,
-                updated_at = ?
-            WHERE task_id = ?
-              AND principal_hash = ?
-              AND state = ?
-            """,
-            (
-                "TASK_STATE_COMPLETED",
-                canonical_json(receipt),
-                canonical_json(history),
-                now,
-                task_id,
-                principal_hash,
-                "TASK_STATE_INPUT_REQUIRED",
-            ),
-        )
-
-        updated_row = conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-
-        if updated_row["state"] != "TASK_STATE_COMPLETED":
-            conn.rollback()
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "TASK_STATE_CONFLICT",
-                        "message": "Task state changed during processing.",
-                    }
-                },
-            )
-
-        conn.execute(
-            """
-            INSERT INTO message_dedup (
-                principal_hash, message_id, message_hash, task_id, created_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (principal_hash, message_id, message_hash, task_id, now),
-        )
-
-        conn.commit()
-
-        task_row = conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-
-    return JSONResponse(content={"task": task_to_public_dict(task_row)})
-
-
-@app.get("/a2a/tasks/{task_id}")
-async def read_task(
-    task_id: str,
-    principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_version),
-) -> Response:
-    with db() as conn:
-        row = get_task_for_principal(conn, principal_hash, task_id)
-        return JSONResponse(content=task_to_public_dict(row))
-
-
-@app.get("/a2a/tasks")
-async def list_tasks(
-    principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_version),
-) -> Response:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM tasks
-            WHERE principal_hash = ?
-            ORDER BY created_at DESC
-            """,
-            (principal_hash,),
-        ).fetchall()
-
-        return JSONResponse(
-            content={"tasks": [task_to_public_dict(row) for row in rows]}
-        )
-
-
-@app.post("/a2a/tasks/{task_id}:cancel")
-async def cancel_task(
-    task_id: str,
-    principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_body_headers),
-) -> Response:
-    now = utc_now()
-
-    with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-
-        row = get_task_for_principal(conn, principal_hash, task_id)
-
-        if row["state"] in TERMINAL_STATES:
-            conn.rollback()
-
-            if row["state"] == "TASK_STATE_CANCELED":
-                return JSONResponse(content=task_to_public_dict(row))
-
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": {
-                        "code": "TASK_ALREADY_TERMINAL",
-                        "message": "Task cannot be canceled.",
-                    }
-                },
-            )
-
-        conn.execute(
-            """
-            UPDATE tasks
-            SET state = ?,
-                receipt_json = NULL,
-                updated_at = ?
-            WHERE task_id = ?
-              AND principal_hash = ?
-              AND state NOT IN (
-                'TASK_STATE_COMPLETED',
-                'TASK_STATE_FAILED',
-                'TASK_STATE_CANCELED',
-                'TASK_STATE_REJECTED'
-              )
-            """,
-            ("TASK_STATE_CANCELED", now, task_id, principal_hash),
-        )
-
-        conn.commit()
-
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-
-        return JSONResponse(content=task_to_public_dict(row))
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", "8000"))
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-    )
+            "version": "1.0.0",
+            "capabilities": {},
+            "supportedInterfaces": [
+                {
+                    "url": BASE_URL,
+                    "protocolBinding": "HTTP+JSON",
+                    "protocolVersion": "1.0",
+                }
