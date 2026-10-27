@@ -1,14 +1,11 @@
-import asyncio
 import hashlib
 import json
 import os
 import sqlite3
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import APIRouter
 from typing import Any, Optional
 
 import httpx
@@ -28,6 +25,7 @@ ALLOWED_TOKENS = {
 }
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 A2A_VERSION = "1.0"
@@ -77,7 +75,7 @@ def init_db() -> None:
                 principal_hash TEXT NOT NULL,
                 batch_id TEXT NOT NULL,
                 state TEXT NOT NULL,
-                initial_message_json TEXT NOT NULL,
+                history_json TEXT NOT NULL,
                 proposals_json TEXT NOT NULL,
                 receipt_json TEXT,
                 created_at TEXT NOT NULL,
@@ -101,19 +99,15 @@ def init_db() -> None:
                 decision_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS locks (
-                name TEXT PRIMARY KEY,
-                owner TEXT NOT NULL,
-                expires_at REAL NOT NULL
-            );
             """
         )
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -149,24 +143,35 @@ def get_principal(
         raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
 
     parts = authorization.split(" ", 1)
+
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
 
     token = parts[1].strip()
+
     if token not in ALLOWED_TOKENS:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
 
     return hash_token(token)
 
 
-def require_a2a_headers(
+def require_a2a_version(
+    a2a_version: Optional[str] = Header(default=None),
+) -> None:
+    if a2a_version != A2A_VERSION:
+        raise HTTPException(status_code=400, detail="UNSUPPORTED_A2A_VERSION")
+
+
+def require_a2a_body_headers(
     a2a_version: Optional[str] = Header(default=None),
     content_type: Optional[str] = Header(default=None),
 ) -> None:
     if a2a_version != A2A_VERSION:
         raise HTTPException(status_code=400, detail="UNSUPPORTED_A2A_VERSION")
 
-    if not content_type or content_type.split(";")[0].strip() != A2A_JSON:
+    media_type = (content_type or "").split(";")[0].strip()
+
+    if media_type != A2A_JSON:
         raise HTTPException(status_code=415, detail="UNSUPPORTED_MEDIA_TYPE")
 
 
@@ -211,12 +216,6 @@ Return strict JSON:
 
 
 def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
-    """
-    Deterministic fallback used when no AI provider is configured.
-
-    Replace or improve this with your own rules if running fully locally.
-    It is intentionally conservative: unresolved or ambiguous packages are held.
-    """
     text = canonical_json(package).lower()
 
     if "already paid" in text or "duplicate payment" in text:
@@ -251,7 +250,7 @@ def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
         "evidenceRefs": refs,
         "rationale": (
             f"Propose {action} for invoice "
-            f"{package.get('invoiceNumber', '')} based on the decisive package "
+            f"{package.get('invoiceNumber', '')} based on decisive package "
             f"evidence {refs[0]}, {refs[1]}, and {refs[2]}."
         ),
     }
@@ -260,16 +259,10 @@ def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
 async def ai_decide_packages(
     packages: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """
-    Batched AI decision layer.
-
-    Returns:
-        {packageId: decision}
-    """
     if not packages:
         return {}
 
-    cache: dict[str, dict[str, Any]] = {}
+    decisions: dict[str, dict[str, Any]] = {}
     uncached: list[dict[str, Any]] = []
     package_hashes: dict[str, str] = {}
 
@@ -285,20 +278,19 @@ async def ai_decide_packages(
             ).fetchone()
 
             if row:
-                cache[package_id] = json.loads(row["decision_json"])
+                decisions[package_id] = json.loads(row["decision_json"])
             else:
                 uncached.append(package)
 
     if not uncached:
-        return cache
+        return decisions
 
     if not OPENAI_API_KEY:
-        fallback = {
-            package.get("packageId", ""): local_fallback_decision(package)
-            for package in uncached
-        }
-        cache.update(fallback)
-        return cache
+        for package in uncached:
+            package_id = package.get("packageId", "")
+            decisions[package_id] = local_fallback_decision(package)
+
+        return decisions
 
     payload = {
         "model": OPENAI_MODEL,
@@ -317,38 +309,33 @@ async def ai_decide_packages(
         ],
     }
 
-    async with httpx.AsyncClient(timeout=35) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-
-    if response.status_code != 200:
-        fallback = {
-            package.get("packageId", ""): local_fallback_decision(package)
-            for package in uncached
-        }
-        cache.update(fallback)
-        return cache
-
     try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            response = await client.post(
+                f"{OPENAI_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+
+        response.raise_for_status()
+
         content = response.json()["choices"][0]["message"]["content"]
         parsed = json.loads(content)
-        decisions = parsed["decisions"]
+        model_decisions = parsed["decisions"]
     except Exception:
-        fallback = {
-            package.get("packageId", ""): local_fallback_decision(package)
-            for package in uncached
-        }
-        cache.update(fallback)
-        return cache
+        for package in uncached:
+            package_id = package.get("packageId", "")
+            decisions[package_id] = local_fallback_decision(package)
+
+        return decisions
 
     by_package_id = {
-        decision.get("packageId", ""): decision for decision in decisions
+        decision.get("packageId", ""): decision
+        for decision in model_decisions
+        if isinstance(decision, dict)
     }
 
     with db() as conn:
@@ -356,11 +343,14 @@ async def ai_decide_packages(
             package_id = package.get("packageId", "")
             decision = by_package_id.get(package_id)
 
-            if not decision or decision.get("action") not in VALID_ACTIONS:
+            if (
+                not isinstance(decision, dict)
+                or decision.get("action") not in VALID_ACTIONS
+            ):
                 decision = local_fallback_decision(package)
 
             decision["packageId"] = package_id
-            cache[package_id] = decision
+            decisions[package_id] = decision
 
             conn.execute(
                 """
@@ -375,7 +365,7 @@ async def ai_decide_packages(
                 ),
             )
 
-    return cache
+    return decisions
 
 
 def build_proposal(
@@ -397,7 +387,12 @@ def build_proposal(
     if not isinstance(rationale, str):
         rationale = ""
 
+    evidence_refs = [
+        ref for ref in evidence_refs if isinstance(ref, str) and ref
+    ][:3]
+
     rationale = rationale.strip()
+
     if len(rationale) < 60:
         rationale = (
             f"Propose {decision.get('action', 'hold_invoice')} for package "
@@ -410,7 +405,7 @@ def build_proposal(
 
     return {
         "packageId": package_id,
-        "actionId": new_id("act").replace("_", "") + uuid.uuid4().hex[:8],
+        "actionId": f"act{uuid.uuid4().hex}",
         "action": decision["action"],
         "facts": {
             "vendorName": str(facts.get("vendorName", "")),
@@ -418,7 +413,7 @@ def build_proposal(
             "amountMinor": int(facts.get("amountMinor", 0)),
             "currency": str(facts.get("currency", "INR")),
         },
-        "evidenceRefs": evidence_refs[:3],
+        "evidenceRefs": evidence_refs,
         "rationale": rationale,
     }
 
@@ -430,12 +425,15 @@ def build_proposal(
 def task_to_public_dict(row: sqlite3.Row) -> dict[str, Any]:
     proposals = json.loads(row["proposals_json"])
     receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else None
+    history = json.loads(row["history_json"])
 
     artifacts: list[dict[str, Any]] = [
         {
             "artifactId": f"artifact_proposals_{row['task_id']}",
+            "name": "Invoice action proposals",
             "parts": [
                 {
+                    "kind": "data",
                     "mediaType": PROPOSALS_MEDIA_TYPE,
                     "data": {
                         "batchId": row["batch_id"],
@@ -450,8 +448,10 @@ def task_to_public_dict(row: sqlite3.Row) -> dict[str, Any]:
         artifacts.append(
             {
                 "artifactId": f"artifact_receipts_{row['task_id']}",
+                "name": "Invoice action receipts",
                 "parts": [
                     {
+                        "kind": "data",
                         "mediaType": RECEIPTS_MEDIA_TYPE,
                         "data": receipt,
                     }
@@ -466,7 +466,7 @@ def task_to_public_dict(row: sqlite3.Row) -> dict[str, Any]:
             "state": row["state"],
             "timestamp": row["updated_at"],
         },
-        "history": [json.loads(row["initial_message_json"])],
+        "history": history,
         "artifacts": artifacts,
     }
 
@@ -577,7 +577,7 @@ async def message_send(
     request: Request,
     body: SendMessageRequest,
     principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_headers),
+    _headers: None = Depends(require_a2a_body_headers),
 ) -> Response:
     message_dict = body.message.model_dump(exclude_none=True)
 
@@ -668,7 +668,10 @@ async def handle_initial_batch(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (existing["task_id"],),
             ).fetchone()
-            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+            return JSONResponse(
+                content={"task": task_to_public_dict(task_row)}
+            )
 
     decisions = await ai_decide_packages(packages)
 
@@ -688,15 +691,14 @@ async def handle_initial_batch(
         seen_package_ids.add(package_id)
 
         decision = decisions.get(package_id)
+
         if not decision or decision.get("action") not in VALID_ACTIONS:
             decision = local_fallback_decision(package)
 
         proposal = build_proposal(package, decision)
 
-        if proposal["actionId"] in seen_action_ids:
-            proposal["actionId"] = new_id("act").replace("_", "") + uuid.uuid4().hex[
-                :8
-            ]
+        while proposal["actionId"] in seen_action_ids:
+            proposal["actionId"] = f"act{uuid.uuid4().hex}"
 
         seen_action_ids.add(proposal["actionId"])
         proposals.append(proposal)
@@ -710,7 +712,7 @@ async def handle_initial_batch(
             """
             INSERT INTO tasks (
                 task_id, context_id, principal_hash, batch_id, state,
-                initial_message_json, proposals_json, receipt_json,
+                history_json, proposals_json, receipt_json,
                 created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """,
@@ -720,7 +722,7 @@ async def handle_initial_batch(
                 principal_hash,
                 batch_id,
                 "TASK_STATE_INPUT_REQUIRED",
-                canonical_json(message_dict),
+                canonical_json([message_dict]),
                 canonical_json(proposals),
                 now,
                 now,
@@ -769,6 +771,8 @@ async def handle_result_continuation(
         raise HTTPException(status_code=400, detail="INVALID_RESULTS")
 
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
         existing = conn.execute(
             """
             SELECT task_id, message_hash
@@ -779,6 +783,8 @@ async def handle_result_continuation(
         ).fetchone()
 
         if existing:
+            conn.rollback()
+
             if existing["message_hash"] != message_hash:
                 return JSONResponse(
                     status_code=409,
@@ -794,17 +800,23 @@ async def handle_result_continuation(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (existing["task_id"],),
             ).fetchone()
-            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+            return JSONResponse(
+                content={"task": task_to_public_dict(task_row)}
+            )
 
         task_row = get_task_for_principal(conn, principal_hash, task_id)
 
         if task_row["context_id"] != context_id:
+            conn.rollback()
             raise HTTPException(status_code=400, detail="CONTEXT_MISMATCH")
 
         if task_row["batch_id"] != batch_id:
+            conn.rollback()
             raise HTTPException(status_code=400, detail="BATCH_MISMATCH")
 
         if task_row["state"] == "TASK_STATE_CANCELED":
+            conn.rollback()
             return JSONResponse(
                 status_code=409,
                 content={
@@ -816,7 +828,16 @@ async def handle_result_continuation(
             )
 
         if task_row["state"] in TERMINAL_STATES:
-            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "TASK_ALREADY_TERMINAL",
+                        "message": "Task is already terminal.",
+                    }
+                },
+            )
 
         proposals = json.loads(task_row["proposals_json"])
         proposals_by_key = {
@@ -837,6 +858,7 @@ async def handle_result_continuation(
             key = (package_id, action_id)
 
             if key in seen_result_keys:
+                conn.rollback()
                 raise HTTPException(status_code=400, detail="DUPLICATE_RESULT")
 
             seen_result_keys.add(key)
@@ -844,16 +866,20 @@ async def handle_result_continuation(
             proposal = proposals_by_key.get(key)
 
             if not proposal:
+                conn.rollback()
                 raise HTTPException(status_code=400, detail="PROPOSAL_MISMATCH")
 
             if proposal["action"] != action:
+                conn.rollback()
                 raise HTTPException(status_code=400, detail="ACTION_MISMATCH")
 
             if outcome not in {"ACCEPTED", "REJECTED"}:
+                conn.rollback()
                 raise HTTPException(status_code=400, detail="INVALID_OUTCOME")
 
             if outcome == "ACCEPTED":
                 if not isinstance(receipt_nonce, str) or not receipt_nonce:
+                    conn.rollback()
                     raise HTTPException(
                         status_code=400,
                         detail="MISSING_RECEIPT_NONCE",
@@ -875,17 +901,26 @@ async def handle_result_continuation(
             "executions": executions,
         }
 
+        history = json.loads(task_row["history_json"])
+        history.append(message_dict)
+
         now = utc_now()
 
         conn.execute(
             """
             UPDATE tasks
-            SET state = ?, receipt_json = ?, updated_at = ?
-            WHERE task_id = ? AND principal_hash = ? AND state = ?
+            SET state = ?,
+                receipt_json = ?,
+                history_json = ?,
+                updated_at = ?
+            WHERE task_id = ?
+              AND principal_hash = ?
+              AND state = ?
             """,
             (
                 "TASK_STATE_COMPLETED",
                 canonical_json(receipt),
+                canonical_json(history),
                 now,
                 task_id,
                 principal_hash,
@@ -893,19 +928,22 @@ async def handle_result_continuation(
             ),
         )
 
-        if conn.total_changes == 0:
-            task_row = get_task_for_principal(conn, principal_hash, task_id)
+        updated_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
 
-            if task_row["state"] == "TASK_STATE_CANCELED":
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "error": {
-                            "code": "TASK_CANCELED",
-                            "message": "Task was canceled.",
-                        }
-                    },
-                )
+        if updated_row["state"] != "TASK_STATE_COMPLETED":
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "TASK_STATE_CONFLICT",
+                        "message": "Task state changed during processing.",
+                    }
+                },
+            )
 
         conn.execute(
             """
@@ -915,6 +953,8 @@ async def handle_result_continuation(
             """,
             (principal_hash, message_id, message_hash, task_id, now),
         )
+
+        conn.commit()
 
         task_row = conn.execute(
             "SELECT * FROM tasks WHERE task_id = ?",
@@ -928,7 +968,7 @@ async def handle_result_continuation(
 async def read_task(
     task_id: str,
     principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_headers),
+    _headers: None = Depends(require_a2a_version),
 ) -> Response:
     with db() as conn:
         row = get_task_for_principal(conn, principal_hash, task_id)
@@ -938,7 +978,7 @@ async def read_task(
 @app.get("/a2a/tasks")
 async def list_tasks(
     principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_headers),
+    _headers: None = Depends(require_a2a_version),
 ) -> Response:
     with db() as conn:
         rows = conn.execute(
@@ -959,14 +999,18 @@ async def list_tasks(
 async def cancel_task(
     task_id: str,
     principal_hash: str = Depends(get_principal),
-    _headers: None = Depends(require_a2a_headers),
+    _headers: None = Depends(require_a2a_body_headers),
 ) -> Response:
     now = utc_now()
 
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
         row = get_task_for_principal(conn, principal_hash, task_id)
 
         if row["state"] in TERMINAL_STATES:
+            conn.rollback()
+
             if row["state"] == "TASK_STATE_CANCELED":
                 return JSONResponse(content=task_to_public_dict(row))
 
@@ -983,16 +1027,22 @@ async def cancel_task(
         conn.execute(
             """
             UPDATE tasks
-            SET state = ?, receipt_json = NULL, updated_at = ?
-            WHERE task_id = ? AND principal_hash = ? AND state NOT IN (
+            SET state = ?,
+                receipt_json = NULL,
+                updated_at = ?
+            WHERE task_id = ?
+              AND principal_hash = ?
+              AND state NOT IN (
                 'TASK_STATE_COMPLETED',
                 'TASK_STATE_FAILED',
                 'TASK_STATE_CANCELED',
                 'TASK_STATE_REJECTED'
-            )
+              )
             """,
             ("TASK_STATE_CANCELED", now, task_id, principal_hash),
         )
+
+        conn.commit()
 
         row = conn.execute(
             "SELECT * FROM tasks WHERE task_id = ?",
@@ -1003,7 +1053,6 @@ async def cancel_task(
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
 
     port = int(os.environ.get("PORT", "8000"))
