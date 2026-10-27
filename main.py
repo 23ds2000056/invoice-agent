@@ -1,0 +1,1013 @@
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from fastapi import APIRouter
+from typing import Any, Optional
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+
+BASE_URL = os.getenv("A2A_BASE_URL", "https://localhost/a2a/").rstrip("/") + "/"
+ALLOWED_TOKENS = {
+    token.strip()
+    for token in os.getenv("ALLOWED_BEARER_TOKENS", "").split(",")
+    if token.strip()
+}
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+A2A_VERSION = "1.0"
+A2A_JSON = "application/a2a+json"
+BATCH_MEDIA_TYPE = "application/vnd.ga5.invoice-claim-batch+json"
+PROPOSALS_MEDIA_TYPE = "application/vnd.ga5.invoice-action-proposals+json"
+RESULTS_MEDIA_TYPE = "application/vnd.ga5.invoice-action-results+json"
+RECEIPTS_MEDIA_TYPE = "application/vnd.ga5.invoice-action-receipts+json"
+
+VALID_ACTIONS = {
+    "settle_invoice",
+    "request_approval",
+    "hold_invoice",
+    "reject_duplicate",
+    "open_exception",
+}
+
+TERMINAL_STATES = {
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_FAILED",
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_REJECTED",
+}
+
+DB_PATH = Path("invoice_agent.db")
+
+
+# -------------------------
+# Database
+# -------------------------
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                context_id TEXT NOT NULL,
+                principal_hash TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                initial_message_json TEXT NOT NULL,
+                proposals_json TEXT NOT NULL,
+                receipt_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_principal
+            ON tasks(principal_hash);
+
+            CREATE TABLE IF NOT EXISTS message_dedup (
+                principal_hash TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (principal_hash, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS package_cache (
+                package_hash TEXT PRIMARY KEY,
+                decision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS locks (
+                name TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            """
+        )
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+# -------------------------
+# Auth and protocol guards
+# -------------------------
+
+def get_principal(
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
+
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
+
+    token = parts[1].strip()
+    if token not in ALLOWED_TOKENS:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    return hash_token(token)
+
+
+def require_a2a_headers(
+    a2a_version: Optional[str] = Header(default=None),
+    content_type: Optional[str] = Header(default=None),
+) -> None:
+    if a2a_version != A2A_VERSION:
+        raise HTTPException(status_code=400, detail="UNSUPPORTED_A2A_VERSION")
+
+    if not content_type or content_type.split(";")[0].strip() != A2A_JSON:
+        raise HTTPException(status_code=415, detail="UNSUPPORTED_MEDIA_TYPE")
+
+
+# -------------------------
+# AI decision layer
+# -------------------------
+
+SYSTEM_PROMPT = """You are an invoice-control agent.
+
+For every invoice package, choose exactly one action:
+- settle_invoice: valid, reconciled, and within autonomous authority.
+- request_approval: commercially valid but outside delegated authority.
+- hold_invoice: payment must wait for a stated verification.
+- reject_duplicate: the same commercial invoice was already paid.
+- open_exception: material records conflict.
+
+Rules:
+- Use only decisive evidence in the package.
+- Return exactly the three decisive bracketed references.
+- Ignore cover sheets, archive examples, irrelevant action words, and negations.
+- A payment for a different invoice is not a duplicate.
+- Never invent facts, evidence references, receipts, or actions.
+
+Return strict JSON:
+{
+  "decisions": [
+    {
+      "packageId": "...",
+      "action": "...",
+      "facts": {
+        "vendorName": "...",
+        "invoiceNumber": "...",
+        "amountMinor": 0,
+        "currency": "..."
+      },
+      "evidenceRefs": ["[...]", "[...]", "[...]"],
+      "rationale": "..."
+    }
+  ]
+}
+"""
+
+
+def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
+    """
+    Deterministic fallback used when no AI provider is configured.
+
+    Replace or improve this with your own rules if running fully locally.
+    It is intentionally conservative: unresolved or ambiguous packages are held.
+    """
+    text = canonical_json(package).lower()
+
+    if "already paid" in text or "duplicate payment" in text:
+        action = "reject_duplicate"
+    elif "exceeds" in text and "authority" in text:
+        action = "request_approval"
+    elif "conflict" in text or "mismatch" in text:
+        action = "open_exception"
+    elif "pending" in text and "verification" in text:
+        action = "hold_invoice"
+    else:
+        action = "hold_invoice"
+
+    refs = [
+        ref
+        for ref in package.get("evidenceRefs", [])
+        if isinstance(ref, str) and ref.startswith("[") and ref.endswith("]")
+    ][:3]
+
+    while len(refs) < 3:
+        refs.append(f"[UNVERIFIED-{len(refs) + 1}]")
+
+    return {
+        "packageId": package.get("packageId", ""),
+        "action": action,
+        "facts": {
+            "vendorName": package.get("vendorName", ""),
+            "invoiceNumber": package.get("invoiceNumber", ""),
+            "amountMinor": int(package.get("amountMinor", 0)),
+            "currency": package.get("currency", "INR"),
+        },
+        "evidenceRefs": refs,
+        "rationale": (
+            f"Propose {action} for invoice "
+            f"{package.get('invoiceNumber', '')} based on the decisive package "
+            f"evidence {refs[0]}, {refs[1]}, and {refs[2]}."
+        ),
+    }
+
+
+async def ai_decide_packages(
+    packages: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """
+    Batched AI decision layer.
+
+    Returns:
+        {packageId: decision}
+    """
+    if not packages:
+        return {}
+
+    cache: dict[str, dict[str, Any]] = {}
+    uncached: list[dict[str, Any]] = []
+    package_hashes: dict[str, str] = {}
+
+    with db() as conn:
+        for package in packages:
+            package_hash = sha256_json(package)
+            package_id = package.get("packageId", "")
+            package_hashes[package_id] = package_hash
+
+            row = conn.execute(
+                "SELECT decision_json FROM package_cache WHERE package_hash = ?",
+                (package_hash,),
+            ).fetchone()
+
+            if row:
+                cache[package_id] = json.loads(row["decision_json"])
+            else:
+                uncached.append(package)
+
+    if not uncached:
+        return cache
+
+    if not OPENAI_API_KEY:
+        fallback = {
+            package.get("packageId", ""): local_fallback_decision(package)
+            for package in uncached
+        }
+        cache.update(fallback)
+        return cache
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"packages": uncached},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=35) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        fallback = {
+            package.get("packageId", ""): local_fallback_decision(package)
+            for package in uncached
+        }
+        cache.update(fallback)
+        return cache
+
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        decisions = parsed["decisions"]
+    except Exception:
+        fallback = {
+            package.get("packageId", ""): local_fallback_decision(package)
+            for package in uncached
+        }
+        cache.update(fallback)
+        return cache
+
+    by_package_id = {
+        decision.get("packageId", ""): decision for decision in decisions
+    }
+
+    with db() as conn:
+        for package in uncached:
+            package_id = package.get("packageId", "")
+            decision = by_package_id.get(package_id)
+
+            if not decision or decision.get("action") not in VALID_ACTIONS:
+                decision = local_fallback_decision(package)
+
+            decision["packageId"] = package_id
+            cache[package_id] = decision
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO package_cache
+                (package_hash, decision_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    package_hashes[package_id],
+                    canonical_json(decision),
+                    utc_now(),
+                ),
+            )
+
+    return cache
+
+
+def build_proposal(
+    package: dict[str, Any],
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    package_id = package.get("packageId", "")
+
+    facts = decision.get("facts", {})
+    evidence_refs = decision.get("evidenceRefs", [])
+    rationale = decision.get("rationale", "")
+
+    if not isinstance(facts, dict):
+        facts = {}
+
+    if not isinstance(evidence_refs, list):
+        evidence_refs = []
+
+    if not isinstance(rationale, str):
+        rationale = ""
+
+    rationale = rationale.strip()
+    if len(rationale) < 60:
+        rationale = (
+            f"Propose {decision.get('action', 'hold_invoice')} for package "
+            f"{package_id}. Decisive evidence: "
+            + ", ".join(evidence_refs[:3])
+            + "."
+        )
+
+    rationale = rationale[:1500]
+
+    return {
+        "packageId": package_id,
+        "actionId": new_id("act").replace("_", "") + uuid.uuid4().hex[:8],
+        "action": decision["action"],
+        "facts": {
+            "vendorName": str(facts.get("vendorName", "")),
+            "invoiceNumber": str(facts.get("invoiceNumber", "")),
+            "amountMinor": int(facts.get("amountMinor", 0)),
+            "currency": str(facts.get("currency", "INR")),
+        },
+        "evidenceRefs": evidence_refs[:3],
+        "rationale": rationale,
+    }
+
+
+# -------------------------
+# Task helpers
+# -------------------------
+
+def task_to_public_dict(row: sqlite3.Row) -> dict[str, Any]:
+    proposals = json.loads(row["proposals_json"])
+    receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else None
+
+    artifacts: list[dict[str, Any]] = [
+        {
+            "artifactId": f"artifact_proposals_{row['task_id']}",
+            "parts": [
+                {
+                    "mediaType": PROPOSALS_MEDIA_TYPE,
+                    "data": {
+                        "batchId": row["batch_id"],
+                        "proposals": proposals,
+                    },
+                }
+            ],
+        }
+    ]
+
+    if receipt is not None:
+        artifacts.append(
+            {
+                "artifactId": f"artifact_receipts_{row['task_id']}",
+                "parts": [
+                    {
+                        "mediaType": RECEIPTS_MEDIA_TYPE,
+                        "data": receipt,
+                    }
+                ],
+            }
+        )
+
+    return {
+        "id": row["task_id"],
+        "contextId": row["context_id"],
+        "status": {
+            "state": row["state"],
+            "timestamp": row["updated_at"],
+        },
+        "history": [json.loads(row["initial_message_json"])],
+        "artifacts": artifacts,
+    }
+
+
+def get_task_for_principal(
+    conn: sqlite3.Connection,
+    principal_hash: str,
+    task_id: str,
+) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT * FROM tasks
+        WHERE task_id = ? AND principal_hash = ?
+        """,
+        (task_id, principal_hash),
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+
+    return row
+
+
+# -------------------------
+# Request models
+# -------------------------
+
+class Part(BaseModel):
+    mediaType: Optional[str] = None
+    data: Optional[dict[str, Any]] = None
+    text: Optional[str] = None
+
+
+class Message(BaseModel):
+    messageId: str
+    role: Optional[str] = None
+    taskId: Optional[str] = None
+    contextId: Optional[str] = None
+    parts: list[Part] = Field(default_factory=list)
+
+
+class Configuration(BaseModel):
+    returnImmediately: Optional[bool] = None
+    historyLength: Optional[int] = None
+    acceptedOutputModes: Optional[list[str]] = None
+
+
+class SendMessageRequest(BaseModel):
+    message: Message
+    configuration: Optional[Configuration] = None
+
+
+# -------------------------
+# FastAPI app
+# -------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Invoice Action Agent", lifespan=lifespan)
+
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card() -> dict[str, Any]:
+    return {
+        "name": "Invoice Action Agent",
+        "description": (
+            "Reads invoice packages, proposes one evidence-based action per "
+            "package, and executes only grader-approved actions."
+        ),
+        "version": "1.0.0",
+        "capabilities": {},
+        "supportedInterfaces": [
+            {
+                "url": BASE_URL,
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+            }
+        ],
+        "defaultInputModes": [BATCH_MEDIA_TYPE],
+        "defaultOutputModes": [
+            PROPOSALS_MEDIA_TYPE,
+            RECEIPTS_MEDIA_TYPE,
+        ],
+        "skills": [
+            {
+                "name": "invoice_action_agent",
+                "description": (
+                    "Chooses settle, approval, hold, duplicate-rejection, or "
+                    "exception actions from invoice evidence."
+                ),
+                "tags": [
+                    "invoices",
+                    "finance",
+                    "approval",
+                    "duplicate-detection",
+                ],
+            }
+        ],
+    }
+
+
+@app.post("/a2a/message:send")
+async def message_send(
+    request: Request,
+    body: SendMessageRequest,
+    principal_hash: str = Depends(get_principal),
+    _headers: None = Depends(require_a2a_headers),
+) -> Response:
+    message_dict = body.message.model_dump(exclude_none=True)
+
+    message_hash = sha256_json(message_dict)
+    message_id = body.message.messageId
+
+    if not body.message.parts:
+        raise HTTPException(status_code=400, detail="INVALID_MESSAGE")
+
+    batch_part = next(
+        (
+            part
+            for part in body.message.parts
+            if part.mediaType == BATCH_MEDIA_TYPE and isinstance(part.data, dict)
+        ),
+        None,
+    )
+
+    result_part = next(
+        (
+            part
+            for part in body.message.parts
+            if part.mediaType == RESULTS_MEDIA_TYPE and isinstance(part.data, dict)
+        ),
+        None,
+    )
+
+    if batch_part:
+        return await handle_initial_batch(
+            principal_hash=principal_hash,
+            message_dict=message_dict,
+            message_id=message_id,
+            message_hash=message_hash,
+            batch_data=batch_part.data,
+        )
+
+    if result_part:
+        return await handle_result_continuation(
+            principal_hash=principal_hash,
+            message_dict=message_dict,
+            message_id=message_id,
+            message_hash=message_hash,
+            result_data=result_part.data,
+        )
+
+    raise HTTPException(status_code=400, detail="UNSUPPORTED_INPUT_MEDIA_TYPE")
+
+
+async def handle_initial_batch(
+    principal_hash: str,
+    message_dict: dict[str, Any],
+    message_id: str,
+    message_hash: str,
+    batch_data: dict[str, Any],
+) -> Response:
+    batch_id = batch_data.get("batchId")
+    packages = batch_data.get("packages")
+
+    if not isinstance(batch_id, str) or not batch_id:
+        raise HTTPException(status_code=400, detail="INVALID_BATCH")
+
+    if not isinstance(packages, list) or not packages:
+        raise HTTPException(status_code=400, detail="INVALID_PACKAGES")
+
+    with db() as conn:
+        existing = conn.execute(
+            """
+            SELECT task_id, message_hash
+            FROM message_dedup
+            WHERE principal_hash = ? AND message_id = ?
+            """,
+            (principal_hash, message_id),
+        ).fetchone()
+
+        if existing:
+            if existing["message_hash"] != message_hash:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            "code": "IDEMPOTENCY_CONFLICT",
+                            "message": "Message ID reused with different content.",
+                        }
+                    },
+                )
+
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (existing["task_id"],),
+            ).fetchone()
+            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+    decisions = await ai_decide_packages(packages)
+
+    proposals: list[dict[str, Any]] = []
+    seen_package_ids: set[str] = set()
+    seen_action_ids: set[str] = set()
+
+    for package in packages:
+        package_id = package.get("packageId")
+
+        if not isinstance(package_id, str) or not package_id:
+            raise HTTPException(status_code=400, detail="INVALID_PACKAGE_ID")
+
+        if package_id in seen_package_ids:
+            raise HTTPException(status_code=400, detail="DUPLICATE_PACKAGE_ID")
+
+        seen_package_ids.add(package_id)
+
+        decision = decisions.get(package_id)
+        if not decision or decision.get("action") not in VALID_ACTIONS:
+            decision = local_fallback_decision(package)
+
+        proposal = build_proposal(package, decision)
+
+        if proposal["actionId"] in seen_action_ids:
+            proposal["actionId"] = new_id("act").replace("_", "") + uuid.uuid4().hex[
+                :8
+            ]
+
+        seen_action_ids.add(proposal["actionId"])
+        proposals.append(proposal)
+
+    task_id = new_id("task")
+    context_id = new_id("context")
+    now = utc_now()
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                task_id, context_id, principal_hash, batch_id, state,
+                initial_message_json, proposals_json, receipt_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                task_id,
+                context_id,
+                principal_hash,
+                batch_id,
+                "TASK_STATE_INPUT_REQUIRED",
+                canonical_json(message_dict),
+                canonical_json(proposals),
+                now,
+                now,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO message_dedup (
+                principal_hash, message_id, message_hash, task_id, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (principal_hash, message_id, message_hash, task_id, now),
+        )
+
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+    return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+
+async def handle_result_continuation(
+    principal_hash: str,
+    message_dict: dict[str, Any],
+    message_id: str,
+    message_hash: str,
+    result_data: dict[str, Any],
+) -> Response:
+    task_id = message_dict.get("taskId")
+    context_id = message_dict.get("contextId")
+    batch_id = result_data.get("batchId")
+    results = result_data.get("results")
+
+    if not isinstance(task_id, str) or not task_id:
+        raise HTTPException(status_code=400, detail="INVALID_TASK_ID")
+
+    if not isinstance(context_id, str) or not context_id:
+        raise HTTPException(status_code=400, detail="INVALID_CONTEXT_ID")
+
+    if not isinstance(batch_id, str) or not batch_id:
+        raise HTTPException(status_code=400, detail="INVALID_BATCH")
+
+    if not isinstance(results, list):
+        raise HTTPException(status_code=400, detail="INVALID_RESULTS")
+
+    with db() as conn:
+        existing = conn.execute(
+            """
+            SELECT task_id, message_hash
+            FROM message_dedup
+            WHERE principal_hash = ? AND message_id = ?
+            """,
+            (principal_hash, message_id),
+        ).fetchone()
+
+        if existing:
+            if existing["message_hash"] != message_hash:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            "code": "IDEMPOTENCY_CONFLICT",
+                            "message": "Message ID reused with different content.",
+                        }
+                    },
+                )
+
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (existing["task_id"],),
+            ).fetchone()
+            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+        task_row = get_task_for_principal(conn, principal_hash, task_id)
+
+        if task_row["context_id"] != context_id:
+            raise HTTPException(status_code=400, detail="CONTEXT_MISMATCH")
+
+        if task_row["batch_id"] != batch_id:
+            raise HTTPException(status_code=400, detail="BATCH_MISMATCH")
+
+        if task_row["state"] == "TASK_STATE_CANCELED":
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "TASK_CANCELED",
+                        "message": "Task was canceled.",
+                    }
+                },
+            )
+
+        if task_row["state"] in TERMINAL_STATES:
+            return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+        proposals = json.loads(task_row["proposals_json"])
+        proposals_by_key = {
+            (proposal["packageId"], proposal["actionId"]): proposal
+            for proposal in proposals
+        }
+
+        executions: list[dict[str, Any]] = []
+        seen_result_keys: set[tuple[str, str]] = set()
+
+        for result in results:
+            package_id = result.get("packageId")
+            action_id = result.get("actionId")
+            action = result.get("action")
+            outcome = result.get("outcome")
+            receipt_nonce = result.get("receiptNonce")
+
+            key = (package_id, action_id)
+
+            if key in seen_result_keys:
+                raise HTTPException(status_code=400, detail="DUPLICATE_RESULT")
+
+            seen_result_keys.add(key)
+
+            proposal = proposals_by_key.get(key)
+
+            if not proposal:
+                raise HTTPException(status_code=400, detail="PROPOSAL_MISMATCH")
+
+            if proposal["action"] != action:
+                raise HTTPException(status_code=400, detail="ACTION_MISMATCH")
+
+            if outcome not in {"ACCEPTED", "REJECTED"}:
+                raise HTTPException(status_code=400, detail="INVALID_OUTCOME")
+
+            if outcome == "ACCEPTED":
+                if not isinstance(receipt_nonce, str) or not receipt_nonce:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="MISSING_RECEIPT_NONCE",
+                    )
+
+                executions.append(
+                    {
+                        "packageId": package_id,
+                        "actionId": action_id,
+                        "action": action,
+                        "receiptNonce": receipt_nonce,
+                        "facts": proposal["facts"],
+                        "evidenceRefs": proposal["evidenceRefs"],
+                    }
+                )
+
+        receipt = {
+            "batchId": batch_id,
+            "executions": executions,
+        }
+
+        now = utc_now()
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET state = ?, receipt_json = ?, updated_at = ?
+            WHERE task_id = ? AND principal_hash = ? AND state = ?
+            """,
+            (
+                "TASK_STATE_COMPLETED",
+                canonical_json(receipt),
+                now,
+                task_id,
+                principal_hash,
+                "TASK_STATE_INPUT_REQUIRED",
+            ),
+        )
+
+        if conn.total_changes == 0:
+            task_row = get_task_for_principal(conn, principal_hash, task_id)
+
+            if task_row["state"] == "TASK_STATE_CANCELED":
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            "code": "TASK_CANCELED",
+                            "message": "Task was canceled.",
+                        }
+                    },
+                )
+
+        conn.execute(
+            """
+            INSERT INTO message_dedup (
+                principal_hash, message_id, message_hash, task_id, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (principal_hash, message_id, message_hash, task_id, now),
+        )
+
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+    return JSONResponse(content={"task": task_to_public_dict(task_row)})
+
+
+@app.get("/a2a/tasks/{task_id}")
+async def read_task(
+    task_id: str,
+    principal_hash: str = Depends(get_principal),
+    _headers: None = Depends(require_a2a_headers),
+) -> Response:
+    with db() as conn:
+        row = get_task_for_principal(conn, principal_hash, task_id)
+        return JSONResponse(content=task_to_public_dict(row))
+
+
+@app.get("/a2a/tasks")
+async def list_tasks(
+    principal_hash: str = Depends(get_principal),
+    _headers: None = Depends(require_a2a_headers),
+) -> Response:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE principal_hash = ?
+            ORDER BY created_at DESC
+            """,
+            (principal_hash,),
+        ).fetchall()
+
+        return JSONResponse(
+            content={"tasks": [task_to_public_dict(row) for row in rows]}
+        )
+
+
+@app.post("/a2a/tasks/{task_id}:cancel")
+async def cancel_task(
+    task_id: str,
+    principal_hash: str = Depends(get_principal),
+    _headers: None = Depends(require_a2a_headers),
+) -> Response:
+    now = utc_now()
+
+    with db() as conn:
+        row = get_task_for_principal(conn, principal_hash, task_id)
+
+        if row["state"] in TERMINAL_STATES:
+            if row["state"] == "TASK_STATE_CANCELED":
+                return JSONResponse(content=task_to_public_dict(row))
+
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "TASK_ALREADY_TERMINAL",
+                        "message": "Task cannot be canceled.",
+                    }
+                },
+            )
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET state = ?, receipt_json = NULL, updated_at = ?
+            WHERE task_id = ? AND principal_hash = ? AND state NOT IN (
+                'TASK_STATE_COMPLETED',
+                'TASK_STATE_FAILED',
+                'TASK_STATE_CANCELED',
+                'TASK_STATE_REJECTED'
+            )
+            """,
+            ("TASK_STATE_CANCELED", now, task_id, principal_hash),
+        )
+
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+        return JSONResponse(content=task_to_public_dict(row))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )
