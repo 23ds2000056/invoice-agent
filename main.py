@@ -18,11 +18,6 @@ load_dotenv()
 
 
 BASE_URL = os.getenv("A2A_BASE_URL", "https://localhost/a2a/").rstrip("/") + "/"
-ALLOWED_TOKENS = {
-    token.strip()
-    for token in os.getenv("ALLOWED_BEARER_TOKENS", "").split(",")
-    if token.strip()
-}
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -181,9 +176,11 @@ def get_principal(
 
     token = parts[1].strip()
 
-    if token not in ALLOWED_TOKENS:
-        return a2a_error(403, "FORBIDDEN", "Invalid bearer token.")
+    if not token:
+        return a2a_error(401, "UNAUTHENTICATED", "Authentication required.")
 
+    # Any well-formed Bearer token is treated as a separate principal.
+    # Store only a hash of the token.
     return hash_token(token)
 
 
