@@ -593,3 +593,562 @@ async def agent_card() -> JSONResponse:
                     "protocolBinding": "HTTP+JSON",
                     "protocolVersion": "1.0",
                 }
+            ],
+            "defaultInputModes": [BATCH_MEDIA_TYPE],
+            "defaultOutputModes": [
+                PROPOSALS_MEDIA_TYPE,
+                RECEIPTS_MEDIA_TYPE,
+            ],
+            "skills": [
+                {
+                    "name": "invoice_action_agent",
+                    "description": (
+                        "Chooses settle, approval, hold, duplicate-rejection, or "
+                        "exception actions from invoice evidence."
+                    ),
+                    "tags": [
+                        "invoices",
+                        "finance",
+                        "approval",
+                        "duplicate-detection",
+                    ],
+                }
+            ],
+        }
+    )
+
+
+@app.post("/a2a/message:send")
+async def message_send(
+    request: Request,
+    body: SendMessageRequest,
+    principal: Any = Depends(get_principal),
+    header_error: Any = Depends(require_a2a_body_headers),
+) -> Response:
+    if isinstance(principal, JSONResponse):
+        return principal
+
+    if isinstance(header_error, JSONResponse):
+        return header_error
+
+    principal_hash = principal
+
+    message_dict = body.message.model_dump(exclude_none=True)
+    message_hash = sha256_json(message_dict)
+    message_id = body.message.messageId
+
+    if not body.message.parts:
+        return a2a_error(400, "INVALID_MESSAGE", "Message has no parts.")
+
+    batch_part = next(
+        (
+            part
+            for part in body.message.parts
+            if part.mediaType == BATCH_MEDIA_TYPE and isinstance(part.data, dict)
+        ),
+        None,
+    )
+
+    result_part = next(
+        (
+            part
+            for part in body.message.parts
+            if part.mediaType == RESULTS_MEDIA_TYPE and isinstance(part.data, dict)
+        ),
+        None,
+    )
+
+    if batch_part:
+        return await handle_initial_batch(
+            principal_hash=principal_hash,
+            message_dict=message_dict,
+            message_id=message_id,
+            message_hash=message_hash,
+            batch_data=batch_part.data,
+        )
+
+    if result_part:
+        return await handle_result_continuation(
+            principal_hash=principal_hash,
+            message_dict=message_dict,
+            message_id=message_id,
+            message_hash=message_hash,
+            result_data=result_part.data,
+        )
+
+    return a2a_error(
+        400,
+        "UNSUPPORTED_INPUT_MEDIA_TYPE",
+        "No supported invoice media type found.",
+    )
+
+
+async def handle_initial_batch(
+    principal_hash: str,
+    message_dict: dict[str, Any],
+    message_id: str,
+    message_hash: str,
+    batch_data: dict[str, Any],
+) -> Response:
+    batch_id = batch_data.get("batchId")
+    packages = batch_data.get("packages")
+
+    if not isinstance(batch_id, str) or not batch_id:
+        return a2a_error(400, "INVALID_BATCH", "Invalid batch ID.")
+
+    if not isinstance(packages, list) or not packages:
+        return a2a_error(400, "INVALID_PACKAGES", "Invalid invoice packages.")
+
+    with db() as conn:
+        existing = conn.execute(
+            """
+            SELECT task_id, message_hash
+            FROM message_dedup
+            WHERE principal_hash = ? AND message_id = ?
+            """,
+            (principal_hash, message_id),
+        ).fetchone()
+
+        if existing:
+            if existing["message_hash"] != message_hash:
+                return a2a_error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "Message ID reused with different content.",
+                )
+
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (existing["task_id"],),
+            ).fetchone()
+
+            return a2a_json_response(
+                {"task": task_to_public_dict(task_row)}
+            )
+
+    decisions = await ai_decide_packages(packages)
+
+    proposals: list[dict[str, Any]] = []
+    seen_package_ids: set[str] = set()
+    seen_action_ids: set[str] = set()
+
+    for package in packages:
+        package_id = package.get("packageId")
+
+        if not isinstance(package_id, str) or not package_id:
+            return a2a_error(400, "INVALID_PACKAGE_ID", "Invalid package ID.")
+
+        if package_id in seen_package_ids:
+            return a2a_error(
+                400,
+                "DUPLICATE_PACKAGE_ID",
+                "Duplicate package ID in batch.",
+            )
+
+        seen_package_ids.add(package_id)
+
+        decision = decisions.get(package_id)
+
+        if not decision or decision.get("action") not in VALID_ACTIONS:
+            decision = local_fallback_decision(package)
+
+        proposal = build_proposal(package, decision)
+
+        while proposal["actionId"] in seen_action_ids:
+            proposal["actionId"] = f"act{uuid.uuid4().hex}"
+
+        seen_action_ids.add(proposal["actionId"])
+        proposals.append(proposal)
+
+    task_id = new_id("task")
+    context_id = new_id("context")
+    now = utc_now()
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                task_id, context_id, principal_hash, batch_id, state,
+                history_json, proposals_json, receipt_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                task_id,
+                context_id,
+                principal_hash,
+                batch_id,
+                "TASK_STATE_INPUT_REQUIRED",
+                canonical_json([message_dict]),
+                canonical_json(proposals),
+                now,
+                now,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO message_dedup (
+                principal_hash, message_id, message_hash, task_id, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (principal_hash, message_id, message_hash, task_id, now),
+        )
+
+        conn.commit()
+
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+    return a2a_json_response({"task": task_to_public_dict(task_row)})
+
+
+async def handle_result_continuation(
+    principal_hash: str,
+    message_dict: dict[str, Any],
+    message_id: str,
+    message_hash: str,
+    result_data: dict[str, Any],
+) -> Response:
+    task_id = message_dict.get("taskId")
+    context_id = message_dict.get("contextId")
+    batch_id = result_data.get("batchId")
+    results = result_data.get("results")
+
+    if not isinstance(task_id, str) or not task_id:
+        return a2a_error(400, "INVALID_TASK_ID", "Invalid task ID.")
+
+    if not isinstance(context_id, str) or not context_id:
+        return a2a_error(400, "INVALID_CONTEXT_ID", "Invalid context ID.")
+
+    if not isinstance(batch_id, str) or not batch_id:
+        return a2a_error(400, "INVALID_BATCH", "Invalid batch ID.")
+
+    if not isinstance(results, list):
+        return a2a_error(400, "INVALID_RESULTS", "Invalid results.")
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute(
+            """
+            SELECT task_id, message_hash
+            FROM message_dedup
+            WHERE principal_hash = ? AND message_id = ?
+            """,
+            (principal_hash, message_id),
+        ).fetchone()
+
+        if existing:
+            conn.rollback()
+
+            if existing["message_hash"] != message_hash:
+                return a2a_error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "Message ID reused with different content.",
+                )
+
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (existing["task_id"],),
+            ).fetchone()
+
+            return a2a_json_response(
+                {"task": task_to_public_dict(task_row)}
+            )
+
+        task_row = get_task_for_principal(conn, principal_hash, task_id)
+
+        if isinstance(task_row, JSONResponse):
+            conn.rollback()
+            return task_row
+
+        if task_row["context_id"] != context_id:
+            conn.rollback()
+            return a2a_error(400, "CONTEXT_MISMATCH", "Context mismatch.")
+
+        if task_row["batch_id"] != batch_id:
+            conn.rollback()
+            return a2a_error(400, "BATCH_MISMATCH", "Batch mismatch.")
+
+        if task_row["state"] == "TASK_STATE_CANCELED":
+            conn.rollback()
+            return a2a_error(
+                409,
+                "TASK_CANCELED",
+                "Task was canceled.",
+            )
+
+        if task_row["state"] in TERMINAL_STATES:
+            conn.rollback()
+            return a2a_error(
+                409,
+                "TASK_ALREADY_TERMINAL",
+                "Task is already terminal.",
+            )
+
+        proposals = json.loads(task_row["proposals_json"])
+        proposals_by_key = {
+            (proposal["packageId"], proposal["actionId"]): proposal
+            for proposal in proposals
+        }
+
+        executions: list[dict[str, Any]] = []
+        seen_result_keys: set[tuple[str, str]] = set()
+
+        for result in results:
+            package_id = result.get("packageId")
+            action_id = result.get("actionId")
+            action = result.get("action")
+            outcome = result.get("outcome")
+            receipt_nonce = result.get("receiptNonce")
+
+            key = (package_id, action_id)
+
+            if key in seen_result_keys:
+                conn.rollback()
+                return a2a_error(
+                    400,
+                    "DUPLICATE_RESULT",
+                    "Duplicate result for package and action.",
+                )
+
+            seen_result_keys.add(key)
+
+            proposal = proposals_by_key.get(key)
+
+            if not proposal:
+                conn.rollback()
+                return a2a_error(
+                    400,
+                    "PROPOSAL_MISMATCH",
+                    "Result does not match a stored proposal.",
+                )
+
+            if proposal["action"] != action:
+                conn.rollback()
+                return a2a_error(
+                    400,
+                    "ACTION_MISMATCH",
+                    "Result action does not match proposal.",
+                )
+
+            if outcome not in {"ACCEPTED", "REJECTED"}:
+                conn.rollback()
+                return a2a_error(
+                    400,
+                    "INVALID_OUTCOME",
+                    "Invalid result outcome.",
+                )
+
+            if outcome == "ACCEPTED":
+                if not isinstance(receipt_nonce, str) or not receipt_nonce:
+                    conn.rollback()
+                    return a2a_error(
+                        400,
+                        "MISSING_RECEIPT_NONCE",
+                        "Accepted result is missing receipt nonce.",
+                    )
+
+                executions.append(
+                    {
+                        "packageId": package_id,
+                        "actionId": action_id,
+                        "action": action,
+                        "receiptNonce": receipt_nonce,
+                        "facts": proposal["facts"],
+                        "evidenceRefs": proposal["evidenceRefs"],
+                    }
+                )
+
+        receipt = {
+            "batchId": batch_id,
+            "executions": executions,
+        }
+
+        history = json.loads(task_row["history_json"])
+        history.append(message_dict)
+
+        now = utc_now()
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET state = ?,
+                receipt_json = ?,
+                history_json = ?,
+                updated_at = ?
+            WHERE task_id = ?
+              AND principal_hash = ?
+              AND state = ?
+            """,
+            (
+                "TASK_STATE_COMPLETED",
+                canonical_json(receipt),
+                canonical_json(history),
+                now,
+                task_id,
+                principal_hash,
+                "TASK_STATE_INPUT_REQUIRED",
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+        if updated_row["state"] != "TASK_STATE_COMPLETED":
+            conn.rollback()
+            return a2a_error(
+                409,
+                "TASK_STATE_CONFLICT",
+                "Task state changed during processing.",
+            )
+
+        conn.execute(
+            """
+            INSERT INTO message_dedup (
+                principal_hash, message_id, message_hash, task_id, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (principal_hash, message_id, message_hash, task_id, now),
+        )
+
+        conn.commit()
+
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+    return a2a_json_response({"task": task_to_public_dict(task_row)})
+
+
+@app.get("/a2a/tasks/{task_id}")
+async def read_task(
+    task_id: str,
+    principal: Any = Depends(get_principal),
+    header_error: Any = Depends(require_a2a_version),
+) -> Response:
+    if isinstance(principal, JSONResponse):
+        return principal
+
+    if isinstance(header_error, JSONResponse):
+        return header_error
+
+    with db() as conn:
+        row = get_task_for_principal(conn, principal, task_id)
+
+        if isinstance(row, JSONResponse):
+            return row
+
+        return a2a_json_response(task_to_public_dict(row))
+
+
+@app.get("/a2a/tasks")
+async def list_tasks(
+    principal: Any = Depends(get_principal),
+    header_error: Any = Depends(require_a2a_version),
+) -> Response:
+    if isinstance(principal, JSONResponse):
+        return principal
+
+    if isinstance(header_error, JSONResponse):
+        return header_error
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE principal_hash = ?
+            ORDER BY created_at DESC
+            """,
+            (principal,),
+        ).fetchall()
+
+        return a2a_json_response(
+            {"tasks": [task_to_public_dict(row) for row in rows]}
+        )
+
+
+@app.post("/a2a/tasks/{task_id}:cancel")
+async def cancel_task(
+    task_id: str,
+    principal: Any = Depends(get_principal),
+    header_error: Any = Depends(require_a2a_body_headers),
+) -> Response:
+    if isinstance(principal, JSONResponse):
+        return principal
+
+    if isinstance(header_error, JSONResponse):
+        return header_error
+
+    principal_hash = principal
+    now = utc_now()
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = get_task_for_principal(conn, principal_hash, task_id)
+
+        if isinstance(row, JSONResponse):
+            conn.rollback()
+            return row
+
+        if row["state"] in TERMINAL_STATES:
+            conn.rollback()
+
+            if row["state"] == "TASK_STATE_CANCELED":
+                return a2a_json_response(task_to_public_dict(row))
+
+            return a2a_error(
+                409,
+                "TASK_ALREADY_TERMINAL",
+                "Task cannot be canceled.",
+            )
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET state = ?,
+                receipt_json = NULL,
+                updated_at = ?
+            WHERE task_id = ?
+              AND principal_hash = ?
+              AND state NOT IN (
+                'TASK_STATE_COMPLETED',
+                'TASK_STATE_FAILED',
+                'TASK_STATE_CANCELED',
+                'TASK_STATE_REJECTED'
+              )
+            """,
+            ("TASK_STATE_CANCELED", now, task_id, principal_hash),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+        return a2a_json_response(task_to_public_dict(row))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+    )
