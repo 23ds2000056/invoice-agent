@@ -113,7 +113,6 @@ def init_db() -> None:
                 for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
             }
 
-            # Migrate away from the older incompatible schema.
             if "history_json" not in columns:
                 logger.info("Migrating incompatible legacy task schema.")
 
@@ -253,55 +252,122 @@ def require_a2a_body_headers(
 # AI decision layer
 # -------------------------
 
-SYSTEM_PROMPT = """You are an invoice-control agent.
+SYSTEM_PROMPT = """You are a rigorous accounts-payable invoice-control agent.
 
-For every invoice package, choose exactly one action:
-- settle_invoice: valid, reconciled, and within autonomous authority.
-- request_approval: commercially valid but outside delegated authority.
-- hold_invoice: payment must wait for a stated verification.
-- reject_duplicate: the same commercial invoice was already paid.
-- open_exception: material records conflict.
+For each invoice package, identify the single controlling paragraph and choose exactly one action.
 
-Rules:
-- Use only decisive evidence in the package.
-- Return exactly the three decisive bracketed references.
-- Ignore cover sheets, archive examples, irrelevant action words, and negations.
-- A payment for a different invoice is not a duplicate.
-- Never invent facts, evidence references, receipts, or actions.
+Decision rules, in priority order:
 
-Return strict JSON:
+1. reject_duplicate
+Choose this only when the package proves that the SAME commercial invoice was already paid.
+The vendor, invoice number, and commercial invoice identity must match.
+A payment for a different invoice, vendor, period, or amount is NOT a duplicate.
+
+2. open_exception
+Choose this when material records materially conflict and the package requires an exception workflow.
+Examples: invoice amount disagrees with purchase order or receipt, vendor identity conflicts, or required records contradict each other.
+
+3. hold_invoice
+Choose this when payment must pause until a specific stated verification completes.
+There must be a clear pending verification, missing confirmation, or explicit instruction to wait.
+Do not use this merely because the package mentions verification in general.
+
+4. request_approval
+Choose this when the invoice is commercially valid and reconciled, but its amount or circumstance is outside the agent's delegated autonomous authority.
+Look for an explicit authority limit and an amount above it.
+
+5. settle_invoice
+Choose this only when the invoice is valid, reconciled, and within autonomous authority.
+All conditions for settlement must be positively established.
+
+Evidence rules:
+- First identify the controlling paragraph.
+- Return exactly three decisive bracketed references from that paragraph.
+- Do not include cover-sheet references, archive examples, training examples, decoys, or irrelevant references.
+- Ignore action words appearing in examples, archived cases, negations, or unrelated text.
+- A word such as settle, approve, reject, or duplicate alone does not determine the action.
+- Never invent evidence references, facts, receipt nonces, or actions.
+
+Return strict JSON only:
 {
   "decisions": [
     {
       "packageId": "...",
-      "action": "...",
+      "action": "settle_invoice|request_approval|hold_invoice|reject_duplicate|open_exception",
       "facts": {
         "vendorName": "...",
         "invoiceNumber": "...",
-        "amountMinor": 0,
-        "currency": "..."
+        "amountMinor": 12345,
+        "currency": "INR"
       },
-      "evidenceRefs": ["[...]", "[...]", "[...]"],
-      "rationale": "..."
+      "evidenceRefs": ["[REF-1]", "[REF-2]", "[REF-3]"],
+      "rationale": "60-1500 characters explaining the chosen action and citing at least two evidence references."
     }
   ]
 }
 """
 
 
-def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
-    text = canonical_json(package).lower()
+def build_decision_user_prompt(packages: list[dict[str, Any]]) -> str:
+    return (
+        "For each package, identify the controlling paragraph, choose exactly "
+        "one action, extract exact facts, and return exactly three decisive "
+        "bracketed evidence references.\n\n"
+        "Packages:\n"
+        + canonical_json(packages)
+    )
 
-    if "already paid" in text or "duplicate payment" in text:
-        action = "reject_duplicate"
-    elif "exceeds" in text and "authority" in text:
-        action = "request_approval"
-    elif "conflict" in text or "mismatch" in text:
-        action = "open_exception"
-    elif "pending" in text and "verification" in text:
-        action = "hold_invoice"
-    else:
-        action = "hold_invoice"
+
+def validate_decision(package_id: str, decision: Any) -> bool:
+    if not isinstance(decision, dict):
+        return False
+
+    if decision.get("packageId") != package_id:
+        return False
+
+    if decision.get("action") not in VALID_ACTIONS:
+        return False
+
+    facts = decision.get("facts")
+
+    if not isinstance(facts, dict):
+        return False
+
+    required_fact_keys = {
+        "vendorName",
+        "invoiceNumber",
+        "amountMinor",
+        "currency",
+    }
+
+    if set(facts.keys()) != required_fact_keys:
+        return False
+
+    amount_minor = facts.get("amountMinor")
+
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int):
+        return False
+
+    refs = decision.get("evidenceRefs")
+
+    if not isinstance(refs, list) or len(refs) != 3:
+        return False
+
+    if not all(
+        isinstance(ref, str)
+        and ref.startswith("[")
+        and ref.endswith("]")
+        for ref in refs
+    ):
+        return False
+
+    rationale = decision.get("rationale")
+
+    return isinstance(rationale, str) and 60 <= len(rationale) <= 1500
+
+
+def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
+    package_id = package.get("packageId", "")
 
     refs = [
         ref
@@ -313,8 +379,8 @@ def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
         refs.append(f"[UNVERIFIED-{len(refs) + 1}]")
 
     return {
-        "packageId": package.get("packageId", ""),
-        "action": action,
+        "packageId": package_id,
+        "action": "hold_invoice",
         "facts": {
             "vendorName": package.get("vendorName", ""),
             "invoiceNumber": package.get("invoiceNumber", ""),
@@ -323,11 +389,51 @@ def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
         },
         "evidenceRefs": refs,
         "rationale": (
-            f"Propose {action} for invoice "
-            f"{package.get('invoiceNumber', '')} based on decisive package "
-            f"evidence {refs[0]}, {refs[1]}, and {refs[2]}."
+            f"Hold invoice {package.get('invoiceNumber', '')} because the "
+            f"package does not yet establish all conditions required for "
+            f"autonomous settlement. Decisive evidence: {refs[0]}, {refs[1]}, "
+            f"and {refs[2]}."
         ),
     }
+
+
+async def call_model_once(
+    packages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_decision_user_prompt(packages),
+            },
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=35) as client:
+        response = await client.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    response.raise_for_status()
+
+    content = response.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(content)
+
+    decisions = parsed.get("decisions")
+
+    if not isinstance(decisions, list):
+        raise ValueError("Model response does not contain a decisions array.")
+
+    return decisions
 
 
 async def ai_decide_packages(
@@ -366,47 +472,23 @@ async def ai_decide_packages(
 
         return decisions
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"packages": uncached},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            },
-        ],
-    }
+    model_decisions: list[dict[str, Any]] = []
 
     try:
-        async with httpx.AsyncClient(timeout=35) as client:
-            response = await client.post(
-                f"{OPENAI_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-
-        response.raise_for_status()
-
-        content = response.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        model_decisions = parsed["decisions"]
+        model_decisions = await call_model_once(uncached)
     except Exception:
-        logger.exception("AI decision failed; using conservative fallback.")
+        logger.exception("First AI decision attempt failed; retrying once.")
 
-        for package in uncached:
-            package_id = package.get("packageId", "")
-            decisions[package_id] = local_fallback_decision(package)
+        try:
+            model_decisions = await call_model_once(uncached)
+        except Exception:
+            logger.exception("Second AI decision attempt failed.")
 
-        return decisions
+            for package in uncached:
+                package_id = package.get("packageId", "")
+                decisions[package_id] = local_fallback_decision(package)
+
+            return decisions
 
     by_package_id = {
         decision.get("packageId", ""): decision
@@ -419,10 +501,7 @@ async def ai_decide_packages(
             package_id = package.get("packageId", "")
             decision = by_package_id.get(package_id)
 
-            if (
-                not isinstance(decision, dict)
-                or decision.get("action") not in VALID_ACTIONS
-            ):
+            if not decision or not validate_decision(package_id, decision):
                 decision = local_fallback_decision(package)
 
             decision["packageId"] = package_id
@@ -440,6 +519,15 @@ async def ai_decide_packages(
                     utc_now(),
                 ),
             )
+
+    distribution = {
+        action: sum(
+            1 for decision in decisions.values() if decision.get("action") == action
+        )
+        for action in VALID_ACTIONS
+    }
+
+    logger.info(f"Decision distribution: {distribution}")
 
     return decisions
 
@@ -467,14 +555,25 @@ def build_proposal(
         ref for ref in evidence_refs if isinstance(ref, str) and ref
     ][:3]
 
+    amount_minor = facts.get("amountMinor", 0)
+
+    if isinstance(amount_minor, str):
+        try:
+            amount_minor = int(amount_minor)
+        except ValueError:
+            amount_minor = 0
+    elif isinstance(amount_minor, float):
+        amount_minor = int(amount_minor)
+    elif not isinstance(amount_minor, int):
+        amount_minor = 0
+
     rationale = rationale.strip()
 
     if len(rationale) < 60:
         rationale = (
             f"Propose {decision.get('action', 'hold_invoice')} for package "
-            f"{package_id}. Decisive evidence: "
-            + ", ".join(evidence_refs[:3])
-            + "."
+            f"{package_id} because the decisive evidence supports this action. "
+            f"Evidence: {', '.join(evidence_refs[:3])}."
         )
 
     rationale = rationale[:1500]
@@ -486,7 +585,7 @@ def build_proposal(
         "facts": {
             "vendorName": str(facts.get("vendorName", "")),
             "invoiceNumber": str(facts.get("invoiceNumber", "")),
-            "amountMinor": int(facts.get("amountMinor", 0)),
+            "amountMinor": amount_minor,
             "currency": str(facts.get("currency", "INR")),
         },
         "evidenceRefs": evidence_refs,
@@ -731,7 +830,6 @@ async def handle_initial_batch(
     if not isinstance(packages, list) or not packages:
         return a2a_error(400, "INVALID_PACKAGES", "Invalid invoice packages.")
 
-    # Fast replay path.
     with db() as conn:
         existing = conn.execute(
             """
@@ -800,8 +898,6 @@ async def handle_initial_batch(
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Recheck inside the write transaction. This safely handles a
-        # concurrent retry using the same principal and messageId.
         existing = conn.execute(
             """
             SELECT task_id, message_hash
