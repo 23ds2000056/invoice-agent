@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -15,6 +16,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("invoice-agent")
 
 
 BASE_URL = os.getenv("A2A_BASE_URL", "https://localhost/a2a/").rstrip("/") + "/"
@@ -94,6 +98,35 @@ def db() -> sqlite3.Connection:
 
 def init_db() -> None:
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        tasks_table = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'tasks'
+            """
+        ).fetchone()
+
+        if tasks_table:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+
+            # Migrate away from the older incompatible schema.
+            if "history_json" not in columns:
+                logger.info("Migrating incompatible legacy task schema.")
+
+                conn.executescript(
+                    """
+                    DROP TABLE IF EXISTS tasks;
+                    DROP TABLE IF EXISTS message_dedup;
+                    DROP TABLE IF EXISTS package_cache;
+                    """
+                )
+
+        conn.commit()
+
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -179,8 +212,8 @@ def get_principal(
     if not token:
         return a2a_error(401, "UNAUTHENTICATED", "Authentication required.")
 
-    # Any well-formed Bearer token is treated as a separate principal.
-    # Store only a hash of the token.
+    # Any well-formed Bearer token is a separate principal.
+    # Store only its hash; never store or log the raw token.
     return hash_token(token)
 
 
@@ -367,6 +400,8 @@ async def ai_decide_packages(
         parsed = json.loads(content)
         model_decisions = parsed["decisions"]
     except Exception:
+        logger.exception("AI decision failed; using conservative fallback.")
+
         for package in uncached:
             package_id = package.get("packageId", "")
             decisions[package_id] = local_fallback_decision(package)
@@ -696,6 +731,7 @@ async def handle_initial_batch(
     if not isinstance(packages, list) or not packages:
         return a2a_error(400, "INVALID_PACKAGES", "Invalid invoice packages.")
 
+    # Fast replay path.
     with db() as conn:
         existing = conn.execute(
             """
@@ -763,6 +799,36 @@ async def handle_initial_batch(
 
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
+
+        # Recheck inside the write transaction. This safely handles a
+        # concurrent retry using the same principal and messageId.
+        existing = conn.execute(
+            """
+            SELECT task_id, message_hash
+            FROM message_dedup
+            WHERE principal_hash = ? AND message_id = ?
+            """,
+            (principal_hash, message_id),
+        ).fetchone()
+
+        if existing:
+            conn.rollback()
+
+            if existing["message_hash"] != message_hash:
+                return a2a_error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "Message ID reused with different content.",
+                )
+
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (existing["task_id"],),
+            ).fetchone()
+
+            return a2a_json_response(
+                {"task": task_to_public_dict(task_row)}
+            )
 
         conn.execute(
             """
