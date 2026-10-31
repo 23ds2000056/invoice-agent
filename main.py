@@ -785,12 +785,15 @@ async def lifespan(app: FastAPI):
             f"the grader; got {BASE_URL}"
         )
 
-    # TEMPORARY: clear stale decisions once. Remove after the next successful Check.
+    # Create all tables before attempting to clear cached decisions.
+    init_db()
+
+    # TEMPORARY: clear stale decisions once.
+    # Remove this block after the next successful Check.
     with db() as conn:
         deleted = conn.execute("DELETE FROM package_cache").rowcount
         logger.info(f"Cleared {deleted} cached package decisions.")
 
-    init_db()
     yield
 
 
