@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -21,7 +22,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("invoice-agent")
 
 
-BASE_URL = os.getenv("A2A_BASE_URL", "https://localhost/a2a/").rstrip("/") + "/"
+def normalize_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    return value + "/"
+
+
+BASE_URL = normalize_base_url(
+    os.getenv("A2A_BASE_URL", "https://localhost/a2a/")
+)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -93,6 +101,7 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -211,8 +220,6 @@ def get_principal(
     if not token:
         return a2a_error(401, "UNAUTHENTICATED", "Authentication required.")
 
-    # Any well-formed Bearer token is a separate principal.
-    # Store only its hash; never store or log the raw token.
     return hash_token(token)
 
 
@@ -254,39 +261,39 @@ def require_a2a_body_headers(
 
 SYSTEM_PROMPT = """You are a rigorous accounts-payable invoice-control agent.
 
-For each invoice package, identify the single controlling paragraph and choose exactly one action.
+For EACH package, independently identify its own controlling paragraph. Do not apply one decision to several packages. Do not be influenced by examples, archived cases, cover sheets, decoys, or action words appearing in unrelated text.
 
-Decision rules, in priority order:
+Choose exactly one action per package.
+
+Decision priority:
 
 1. reject_duplicate
-Choose this only when the package proves that the SAME commercial invoice was already paid.
-The vendor, invoice number, and commercial invoice identity must match.
+Choose only when the package proves that the SAME commercial invoice was already paid.
+The commercial invoice identity must match: vendor and invoice number must correspond.
 A payment for a different invoice, vendor, period, or amount is NOT a duplicate.
 
 2. open_exception
-Choose this when material records materially conflict and the package requires an exception workflow.
-Examples: invoice amount disagrees with purchase order or receipt, vendor identity conflicts, or required records contradict each other.
+Choose when material records materially conflict and the package requires an exception workflow.
+Examples: invoice amount disagrees with purchase order or goods receipt, vendor identity conflicts, or required records contradict each other.
 
 3. hold_invoice
-Choose this when payment must pause until a specific stated verification completes.
+Choose only when payment must pause until a specific, stated verification completes.
 There must be a clear pending verification, missing confirmation, or explicit instruction to wait.
-Do not use this merely because the package mentions verification in general.
+Do not choose this merely because verification is mentioned generally.
 
 4. request_approval
-Choose this when the invoice is commercially valid and reconciled, but its amount or circumstance is outside the agent's delegated autonomous authority.
-Look for an explicit authority limit and an amount above it.
+Choose when the invoice is commercially valid and reconciled, but the amount or circumstance is outside the agent's delegated autonomous authority.
+There must be an explicit authority limit and evidence that the invoice exceeds it.
 
 5. settle_invoice
-Choose this only when the invoice is valid, reconciled, and within autonomous authority.
-All conditions for settlement must be positively established.
+Choose only when the invoice is valid, reconciled, and within autonomous authority.
+All settlement conditions must be positively established by the controlling paragraph.
 
 Evidence rules:
-- First identify the controlling paragraph.
-- Return exactly three decisive bracketed references from that paragraph.
-- Do not include cover-sheet references, archive examples, training examples, decoys, or irrelevant references.
-- Ignore action words appearing in examples, archived cases, negations, or unrelated text.
-- A word such as settle, approve, reject, or duplicate alone does not determine the action.
+- Return exactly three bracketed evidence references copied exactly, character for character, from the controlling paragraph of that package.
+- Do not use cover-sheet, archive, training-example, or decoy references.
 - Never invent evidence references, facts, receipt nonces, or actions.
+- Explain how the cited evidence supports the chosen action.
 
 Return strict JSON only:
 {
@@ -300,7 +307,11 @@ Return strict JSON only:
         "amountMinor": 12345,
         "currency": "INR"
       },
-      "evidenceRefs": ["[REF-1]", "[REF-2]", "[REF-3]"],
+      "evidenceRefs": [
+        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]",
+        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]",
+        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]"
+      ],
       "rationale": "60-1500 characters explaining the chosen action and citing at least two evidence references."
     }
   ]
@@ -310,11 +321,32 @@ Return strict JSON only:
 
 def build_decision_user_prompt(packages: list[dict[str, Any]]) -> str:
     return (
-        "For each package, identify the controlling paragraph, choose exactly "
-        "one action, extract exact facts, and return exactly three decisive "
-        "bracketed evidence references.\n\n"
+        "For each package, identify its controlling paragraph, choose exactly one "
+        "action, extract exact facts, and return exactly three decisive bracketed "
+        "evidence references.\n\n"
+        "IMPORTANT: Every evidenceRefs entry must be copied character-for-character "
+        "from a bracketed reference that appears in that same package. Do not invent "
+        "references such as [REF-1] unless that exact string appears in the package.\n\n"
         "Packages:\n"
         + canonical_json(packages)
+    )
+
+
+def extract_package_refs(package: dict[str, Any]) -> set[str]:
+    text = canonical_json(package)
+    return set(re.findall(r"\[[^\[\]]+\]", text))
+
+
+def refs_are_valid(package: dict[str, Any], decision: dict[str, Any]) -> bool:
+    allowed_refs = extract_package_refs(package)
+    refs = decision.get("evidenceRefs")
+
+    if not isinstance(refs, list) or len(refs) != 3:
+        return False
+
+    return all(
+        isinstance(ref, str) and ref in allowed_refs
+        for ref in refs
     )
 
 
@@ -340,12 +372,12 @@ def validate_decision(package_id: str, decision: Any) -> bool:
         "currency",
     }
 
-    if set(facts.keys()) != required_fact_keys:
+    if not required_fact_keys.issubset(facts.keys()):
         return False
 
     amount_minor = facts.get("amountMinor")
 
-    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int):
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, (int, float)):
         return False
 
     refs = decision.get("evidenceRefs")
@@ -369,9 +401,11 @@ def validate_decision(package_id: str, decision: Any) -> bool:
 def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
     package_id = package.get("packageId", "")
 
+    allowed_refs = sorted(extract_package_refs(package))
+
     refs = [
         ref
-        for ref in package.get("evidenceRefs", [])
+        for ref in allowed_refs
         if isinstance(ref, str) and ref.startswith("[") and ref.endswith("]")
     ][:3]
 
@@ -382,17 +416,17 @@ def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
         "packageId": package_id,
         "action": "hold_invoice",
         "facts": {
-            "vendorName": package.get("vendorName", ""),
-            "invoiceNumber": package.get("invoiceNumber", ""),
-            "amountMinor": int(package.get("amountMinor", 0)),
-            "currency": package.get("currency", "INR"),
+            "vendorName": str(package.get("vendorName", "")),
+            "invoiceNumber": str(package.get("invoiceNumber", "")),
+            "amountMinor": int(package.get("amountMinor", 0) or 0),
+            "currency": str(package.get("currency", "INR")),
         },
         "evidenceRefs": refs,
         "rationale": (
-            f"Hold invoice {package.get('invoiceNumber', '')} because the "
-            f"package does not yet establish all conditions required for "
-            f"autonomous settlement. Decisive evidence: {refs[0]}, {refs[1]}, "
-            f"and {refs[2]}."
+            f"Propose hold_invoice for package {package_id} because the available "
+            f"package evidence does not yet positively establish every condition "
+            f"required for autonomous settlement. Decisive evidence: {refs[0]}, "
+            f"{refs[1]}, and {refs[2]}."
         ),
     }
 
@@ -501,24 +535,31 @@ async def ai_decide_packages(
             package_id = package.get("packageId", "")
             decision = by_package_id.get(package_id)
 
-            if not decision or not validate_decision(package_id, decision):
-                decision = local_fallback_decision(package)
-
-            decision["packageId"] = package_id
-            decisions[package_id] = decision
-
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO package_cache
-                (package_hash, decision_json, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    package_hashes[package_id],
-                    canonical_json(decision),
-                    utc_now(),
-                ),
+            is_valid = (
+                decision is not None
+                and validate_decision(package_id, decision)
+                and refs_are_valid(package, decision)
             )
+
+            if is_valid:
+                decision["packageId"] = package_id
+                decisions[package_id] = decision
+
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO package_cache
+                    (package_hash, decision_json, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        package_hashes[package_id],
+                        canonical_json(decision),
+                        utc_now(),
+                    ),
+                )
+            else:
+                # Never cache a fallback or invalid decision.
+                decisions[package_id] = local_fallback_decision(package)
 
     distribution = {
         action: sum(
@@ -567,13 +608,14 @@ def build_proposal(
     elif not isinstance(amount_minor, int):
         amount_minor = 0
 
+    action = decision.get("action", "hold_invoice")
     rationale = rationale.strip()
 
     if len(rationale) < 60:
         rationale = (
-            f"Propose {decision.get('action', 'hold_invoice')} for package "
-            f"{package_id} because the decisive evidence supports this action. "
-            f"Evidence: {', '.join(evidence_refs[:3])}."
+            f"Propose {action} for package {package_id} because the decisive "
+            f"package evidence supports this action. Evidence: "
+            f"{', '.join(evidence_refs[:3])}."
         )
 
     rationale = rationale[:1500]
@@ -581,7 +623,7 @@ def build_proposal(
     return {
         "packageId": package_id,
         "actionId": f"act{uuid.uuid4().hex}",
-        "action": decision["action"],
+        "action": action,
         "facts": {
             "vendorName": str(facts.get("vendorName", "")),
             "invoiceNumber": str(facts.get("invoiceNumber", "")),
@@ -646,6 +688,17 @@ def task_to_public_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def task_to_list_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["task_id"],
+        "contextId": row["context_id"],
+        "status": {
+            "state": row["state"],
+            "timestamp": row["updated_at"],
+        },
+    }
+
+
 def get_task_for_principal(
     conn: sqlite3.Connection,
     principal_hash: str,
@@ -700,6 +753,12 @@ class SendMessageRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not BASE_URL.startswith("https://") or "localhost" in BASE_URL:
+        raise RuntimeError(
+            "A2A_BASE_URL must be the exact public HTTPS base URL submitted to "
+            f"the grader; got {BASE_URL}"
+        )
+
     init_db()
     yield
 
@@ -709,7 +768,7 @@ app = FastAPI(title="Invoice Action Agent", lifespan=lifespan)
 
 @app.get("/.well-known/agent-card.json")
 async def agent_card() -> JSONResponse:
-    return a2a_json_response(
+    return JSONResponse(
         {
             "name": "Invoice Action Agent",
             "description": (
@@ -732,7 +791,8 @@ async def agent_card() -> JSONResponse:
             ],
             "skills": [
                 {
-                    "name": "invoice_action_agent",
+                    "id": "invoice_action_agent",
+                    "name": "Invoice action agent",
                     "description": (
                         "Chooses settle, approval, hold, duplicate-rejection, or "
                         "exception actions from invoice evidence."
@@ -745,7 +805,8 @@ async def agent_card() -> JSONResponse:
                     ],
                 }
             ],
-        }
+        },
+        media_type="application/json",
     )
 
 
@@ -1224,7 +1285,8 @@ async def list_tasks(
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT * FROM tasks
+            SELECT task_id, context_id, state, updated_at
+            FROM tasks
             WHERE principal_hash = ?
             ORDER BY created_at DESC
             """,
@@ -1232,7 +1294,7 @@ async def list_tasks(
         ).fetchall()
 
         return a2a_json_response(
-            {"tasks": [task_to_public_dict(row) for row in rows]}
+            {"tasks": [task_to_list_item(row) for row in rows]}
         )
 
 
