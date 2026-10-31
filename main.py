@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -32,8 +33,8 @@ BASE_URL = normalize_base_url(
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4.1-nano")
 
 A2A_VERSION = "1.0"
 A2A_JSON = "application/a2a+json"
@@ -200,10 +201,6 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
-def chunk_list(items: list[Any], size: int) -> list[list[Any]]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
-
 # -------------------------
 # Auth and protocol guards
 # -------------------------
@@ -265,41 +262,44 @@ def require_a2a_body_headers(
 
 SYSTEM_PROMPT = """You are a rigorous accounts-payable invoice-control agent.
 
-For EACH package, independently identify its own controlling paragraph. Decide only from that package's controlling facts. Do not apply one decision to multiple packages. Ignore cover sheets, archived examples, training examples, decoys, negations, and action words in unrelated text.
+Analyze ONE invoice package at a time. Identify the single controlling paragraph that determines the required business action. Decide only from that package's controlling facts.
 
-Choose exactly one action per package. Never default to hold_invoice. Choose the action required by the controlling paragraph.
+Ignore cover sheets, archived examples, training examples, decoys, negations, and action words appearing in unrelated text.
 
-Decision priority:
+Choose exactly one action. Never default to hold_invoice. Choose the most specific action supported by the controlling paragraph.
 
-1. reject_duplicate
+Decision rules:
+
+- reject_duplicate
 Choose only when the package proves that the SAME commercial invoice was already paid.
 The vendor and commercial invoice number must match the previously paid invoice.
 A payment for a different invoice, vendor, period, or amount is NOT a duplicate.
 
-2. open_exception
+- open_exception
 Choose when material records materially conflict and the package requires an exception workflow.
 Examples: invoice amount disagrees with purchase order or goods receipt, vendor identity conflicts, or required records contradict each other.
 
-3. hold_invoice
+- hold_invoice
 Choose only when payment must pause until a specific, stated verification completes.
 There must be a clear pending verification, missing confirmation, or explicit instruction to wait.
 Do not choose this merely because verification is mentioned generally.
 
-4. request_approval
+- request_approval
 Choose when the invoice is commercially valid and reconciled, but the amount or circumstance is outside the agent's delegated autonomous authority.
 There must be an explicit authority limit and evidence that the invoice exceeds it.
 
-5. settle_invoice
-Choose only when the invoice is valid, reconciled, and within autonomous authority.
+- settle_invoice
+Choose only when the invoice is valid, reconciled, and within the explicitly stated autonomous authority limit.
 All settlement conditions must be positively established by the controlling paragraph.
 
 Evidence rules:
-- First identify the single controlling paragraph.
-- Return exactly three bracketed evidence references copied exactly, character for character, from that paragraph.
+- First identify the controlling paragraph.
+- Return exactly three decisive evidence references copied exactly, character for character, from that paragraph.
+- If references are bracketed in the package, retain the brackets.
+- If references are plain IDs in the package, return those exact IDs.
 - Do not use cover-sheet, archive, training-example, or decoy references.
 - Never invent evidence references, facts, receipt nonces, or actions.
 - The rationale must explicitly explain how the cited evidence leads to the chosen action.
-- If a required condition is not established, choose the least destructive action supported by the controlling facts; do not automatically choose hold_invoice.
 
 Return strict JSON only:
 {
@@ -314,9 +314,9 @@ Return strict JSON only:
         "currency": "INR"
       },
       "evidenceRefs": [
-        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]",
-        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]",
-        "[EXACT BRACKETED REFERENCE FROM THIS PACKAGE]"
+        "[EXACT REFERENCE FROM THIS PACKAGE]",
+        "[EXACT REFERENCE FROM THIS PACKAGE]",
+        "[EXACT REFERENCE FROM THIS PACKAGE]"
       ],
       "rationale": "60-1500 characters explaining the chosen action and citing at least two evidence references."
     }
@@ -325,49 +325,39 @@ Return strict JSON only:
 """
 
 
-def build_decision_user_prompt(packages: list[dict[str, Any]]) -> str:
+def build_package_user_prompt(package: dict[str, Any]) -> str:
     return (
-        "For each package, independently identify its controlling paragraph, choose "
-        "exactly one action, extract exact facts, and return exactly three decisive "
-        "bracketed evidence references.\n\n"
-        "IMPORTANT: Every evidenceRefs entry must be copied character-for-character "
-        "from a bracketed reference that appears in that same package. Do not invent "
-        "references such as [REF-1] unless that exact string appears in the package.\n\n"
-        "Do not default to hold_invoice. Choose the action required by each package's "
-        "controlling facts.\n\n"
-        "Packages:\n"
-        + canonical_json(packages)
-    )
-
-
-def build_repair_user_prompt(package: dict[str, Any]) -> str:
-    return (
-        "Decide this one invoice package from its own controlling paragraph.\n"
-        "Do not default to hold_invoice.\n"
-        "Return exactly three bracketed evidence references copied exactly, "
-        "character for character, from this package.\n"
+        "Analyze this single invoice package.\n"
+        "Step 1: Identify the one controlling paragraph that determines the required business action.\n"
+        "Step 2: Ignore cover sheets, archived examples, training examples, decoys, negations, and action words in unrelated text.\n"
+        "Step 3: Choose exactly one action based only on that controlling paragraph.\n"
+        "Step 4: Return exactly three evidence references copied exactly, character for character, from that paragraph.\n"
+        "Step 5: Explain how those references prove the chosen action.\n\n"
+        "Do not default to hold_invoice. Choose the action the controlling facts require.\n\n"
         "Return strict JSON with exactly one object in the decisions array.\n\n"
         "Package:\n"
         + canonical_json(package)
     )
 
 
-def extract_package_refs(package: dict[str, Any]) -> set[str]:
-    text = canonical_json(package)
-    return set(re.findall(r"\[[^\[\]]+\]", text))
-
-
 def refs_are_valid(package: dict[str, Any], decision: dict[str, Any]) -> bool:
-    allowed_refs = extract_package_refs(package)
+    package_text = canonical_json(package)
     refs = decision.get("evidenceRefs")
 
     if not isinstance(refs, list) or len(refs) != 3:
         return False
 
-    return all(
-        isinstance(ref, str) and ref in allowed_refs
-        for ref in refs
-    )
+    for ref in refs:
+        if not isinstance(ref, str) or not ref.strip():
+            return False
+
+        clean = ref.strip()
+        bare = clean.strip("[]")
+
+        if clean not in package_text and bare not in package_text:
+            return False
+
+    return True
 
 
 def validate_decision(package_id: str, decision: Any) -> bool:
@@ -407,8 +397,7 @@ def validate_decision(package_id: str, decision: Any) -> bool:
 
     if not all(
         isinstance(ref, str)
-        and ref.startswith("[")
-        and ref.endswith("]")
+        and ref.strip()
         for ref in refs
     ):
         return False
@@ -433,13 +422,14 @@ def is_decision_usable(
 def local_fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
     package_id = package.get("packageId", "")
 
-    allowed_refs = sorted(extract_package_refs(package))
+    text = canonical_json(package)
+    bracketed_refs = re.findall(r"\[[^\[\]]+\]", text)
+    bare_refs = re.findall(
+        r"\b(?:REF|EVID|EV|DOC|NOTE)-[A-Za-z0-9_-]+\b",
+        text,
+    )
 
-    refs = [
-        ref
-        for ref in allowed_refs
-        if isinstance(ref, str) and ref.startswith("[") and ref.endswith("]")
-    ][:3]
+    refs = (bracketed_refs + bare_refs)[:3]
 
     while len(refs) < 3:
         refs.append(f"[UNVERIFIED-{len(refs) + 1}]")
@@ -479,49 +469,6 @@ def cache_decision(package_hash: str, decision: dict[str, Any]) -> None:
         )
 
 
-async def call_model_for_packages(
-    packages: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": build_decision_user_prompt(packages),
-            },
-        ],
-    }
-
-    async with httpx.AsyncClient(timeout=35) as client:
-        response = await client.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-
-    response.raise_for_status()
-
-    content = response.json()["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-
-    decisions = parsed.get("decisions")
-
-    if not isinstance(decisions, list):
-        raise ValueError("Model response does not contain a decisions array.")
-
-    return {
-        decision.get("packageId", ""): decision
-        for decision in decisions
-        if isinstance(decision, dict)
-    }
-
-
 async def decide_single_package(
     package: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
@@ -533,12 +480,12 @@ async def decide_single_package(
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": build_repair_user_prompt(package),
+                "content": build_package_user_prompt(package),
             },
         ],
     }
 
-    async with httpx.AsyncClient(timeout=35) as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers={
@@ -602,35 +549,43 @@ async def ai_decide_packages(
 
         return decisions
 
-    for chunk in chunk_list(uncached, 3):
-        try:
-            chunk_decisions = await call_model_for_packages(chunk)
-        except Exception:
-            logger.exception("Chunk decision failed; falling back per package.")
-            chunk_decisions = {}
+    semaphore = asyncio.Semaphore(6)
 
-        for package in chunk:
-            package_id = package.get("packageId", "")
-            decision = chunk_decisions.get(package_id)
+    async def decide_with_limit(
+        package: dict[str, Any],
+    ) -> tuple[str, Any]:
+        package_id = package.get("packageId", "")
 
-            if is_decision_usable(package, package_id, decision):
-                decisions[package_id] = decision
-                cache_decision(package_hashes[package_id], decision)
-                continue
-
+        async with semaphore:
             try:
-                repaired = await decide_single_package(package)
-                decision = repaired.get(package_id)
+                model_result = await decide_single_package(package)
+                return package_id, model_result.get(package_id)
             except Exception:
-                logger.exception("Single-package repair failed.")
-                decision = None
+                logger.exception("Single-package decision failed.")
+                return package_id, None
 
-            if is_decision_usable(package, package_id, decision):
-                decisions[package_id] = decision
-                cache_decision(package_hashes[package_id], decision)
-            else:
-                # Never cache a fallback or invalid decision.
-                decisions[package_id] = local_fallback_decision(package)
+    results = await asyncio.gather(
+        *(decide_with_limit(package) for package in uncached)
+    )
+
+    for package, (package_id, decision) in zip(uncached, results):
+        if is_decision_usable(package, package_id, decision):
+            decisions[package_id] = decision
+            cache_decision(package_hashes[package_id], decision)
+            continue
+
+        logger.warning(
+            "Decision rejected: package_id=%s, has_decision=%s, "
+            "schema_valid=%s, refs_valid=%s, refs=%s",
+            package_id,
+            decision is not None,
+            validate_decision(package_id, decision) if decision else False,
+            refs_are_valid(package, decision) if decision else False,
+            decision.get("evidenceRefs") if isinstance(decision, dict) else None,
+        )
+
+        # Never cache fallback decisions.
+        decisions[package_id] = local_fallback_decision(package)
 
     distribution = {
         action: sum(
@@ -829,6 +784,11 @@ async def lifespan(app: FastAPI):
             "A2A_BASE_URL must be the exact public HTTPS base URL submitted to "
             f"the grader; got {BASE_URL}"
         )
+
+    # TEMPORARY: clear stale decisions once. Remove after the next successful Check.
+    with db() as conn:
+        deleted = conn.execute("DELETE FROM package_cache").rowcount
+        logger.info(f"Cleared {deleted} cached package decisions.")
 
     init_db()
     yield
